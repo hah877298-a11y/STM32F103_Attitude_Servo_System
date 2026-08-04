@@ -1,341 +1,158 @@
 #include "i2c.h"
 
-/* ============================================================
- *                   软 件 模 拟 I2C 实 现
- * ============================================================
- *
- *  协议回顾:
- *    I2C (Inter-Integrated Circuit) 是飞利浦开发的串行总线协议.
- *    只需两根线: SCL (时钟) + SDA (数据), 支持多主机多从机.
- *
- *  电平与方向:
- *    空闲状态 → SCL=1, SDA=1 (由上拉电阻维持)
- *    SDA 方向 → 始终为"开漏输出"模式, 释放总线 = 输出高电平
- *                (开漏输出不会真正输出高电压, 只是不拉低)
- *
- *  三个基本时序单元:
- *    [起始信号] SCL=1 时 SDA: 1→0  | 通信开始!
- *    [停止信号] SCL=1 时 SDA: 0→1  | 通信结束!
- *    [数据变化] 只能在 SCL=0 期间  | 数据在 SCL 上升沿被采样
- *
- *  每传输 8 bit (1 字节) 后, 接收方必须回复 1 bit 应答:
- *    0 = ACK  (有应答, 继续)
- *    1 = NAK  (无应答, 停止)
- *
- *  本实验: 主机 = STM32, 从机 = MPU6050(0x68) + OLED(0x3C)
- * ============================================================
+/**
+ * @file    i2c.c
+ * @brief   Software-emulated I2C master (bit-banged GPIO).
+ * @note    PB10 = SCL, PB11 = SDA, open-drain with 4.7k pull-ups.
+ *          Slaves: MPU6050 (0x68), SSD1306 (0x3C).
+ *          Half-period delay ~5 us -> ~100 kHz (standard mode).
  */
 
-/* ========== 时 序 延 时 函 数 ========== */
-/**
- * @brief  I2C 总线延时, 约 5 微秒
- *
- *  为什么需要延时?  I2C 是同步协议, 但总线上的器件需要时间:
- *    - 从机检测到 SCL 跳变后, 需要时间准备数据或处理命令
- *    - 如果 SCL 变化太快, 从机来不及响应, 通信就会失败
- *
- *  这个延时决定了 I2C 通信速率:
- *    延时 ≈ 5μs → 半周期 ≈ 5μs → 全周期 ≈ 10μs → 频率 ≈ 100kHz (标准模式)
- *    这也是最稳定、兼容性最好的速率, 几乎所有 I2C 设备都支持 100kHz.
- *
- *  实现方式: 用 for 循环 + NOP 空指令消耗 CPU 时间.
- *    - volatile 防止编译器把循环优化掉
- *    - __NOP() 是一个什么都不做的汇编指令, 消耗 1 个 CPU 周期
- *    - 在 72MHz 的 STM32F103 上, 50 次迭代 ≈ 5μs (实际值因编译器优化而异)
- *
- *  进阶思考 (供学有余力时参考):
- *    更精确的做法是用 SysTick 定时器或硬件定时器, 但软件延时足够用了,
- *    因为 I2C 协议对时序容差非常大——哪怕差个 30% 也能正常通信.
- */
+/** @brief I2C half-period delay (~5 us @ 72 MHz, ~100 kHz SCL). */
 static void I2C_Delay(void)
 {
-    /*
-     * 50 次 NOP 迭代 → 约 5µs 半周期 → ~100kHz (标准模式).
-     * 如果通信不稳定, 可改为 200 次 (约 20µs, ~25kHz) 排查.
-     */
+    /* If the bus is unstable, raise to 200 iterations (~25 kHz). */
     for (volatile uint16_t i = 0; i < 50; i++)
     {
         __NOP();
     }
 }
 
-/* ========== GPIO 初 始 化 ========== */
 /**
- * @brief  初始化 I2C 使用的 GPIO 引脚
- *
- *  做两件事:
- *    1. 使能 GPIOB 的时钟     (STM32 所有外设都要先开时钟才能用)
- *    2. 配置 PB10/PB11 为开漏输出 (推挽输出不能用于 I2C! 见下方解释)
- *    3. 初始状态置高电平 (释放总线, 进入空闲状态)
- *
- *  ★ 为什么必须用开漏输出 (Open-Drain) 而不是推挽输出 (Push-Pull)?
- *
- *  推挽输出的问题:
- *    - 推挽输出有上下两个 MOS 管, 输出高电平时上管导通, 引脚被硬拉到 3.3V
- *    - 如果有两个设备同时一个输出 0 一个输出 1 → 电源对地短路! → 烧毁芯片!
- *
- *  开漏输出的优势:
- *    - 只有下管 (NMOS), 没有上管
- *    - 输出 1 → NMOS 截止 → 引脚不驱动 → 靠上拉电阻拉到高电平 → "释放总线"
- *    - 输出 0 → NMOS 导通 → 引脚强拉到 GND
- *    - 任意设备输出 0 总线就是 0, 所有设备都释放总线才是 1
- *    - 这种特性叫 "线与" (Wired-AND), 是实现多主机仲裁和从机应答的关键!
+ * @brief  Initialize I2C pins (PB10/PB11) as open-drain outputs.
+ * @note   Open-drain is mandatory: it provides wired-AND arbitration
+ *         and lets slaves drive SDA low for ACK.
  */
 void SoftI2C_Init(void)
 {
     GPIO_InitTypeDef GPIO_InitStructure;
 
-    /* 第 1 步: 开启 GPIOB 的时钟
-     * STM32F103 的所有外设默认时钟都是关着的 (为了省电),
-     * 使用前必须手动打开. GPIOB 挂在 APB2 总线上.
-     */
     RCC_APB2PeriphClockCmd(I2C_RCC_CLOCK, ENABLE);
 
-    /* 第 2 步: 配置 PB10 (SCL) 和 PB11 (SDA)
-     * GPIO_Mode_Out_OD = 通用开漏输出模式
-     * GPIO_Speed_50MHz = 引脚最大翻转速率 50MHz (对我们低速 I2C 来说绰绰有余)
-     */
     GPIO_InitStructure.GPIO_Pin   = I2C_SCL_PIN | I2C_SDA_PIN;
-    GPIO_InitStructure.GPIO_Mode  = GPIO_Mode_Out_OD;   /* ★ 关键: 开漏输出! */
+    GPIO_InitStructure.GPIO_Mode  = GPIO_Mode_Out_OD;
     GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
     GPIO_Init(I2C_PORT, &GPIO_InitStructure);
 
-    /* 第 3 步: 释放总线, 空闲状态 SCL=1, SDA=1
-     * SET 在开漏模式下是让 MOS 管截止, 由上拉电阻把线拉到高电平
-     */
+    /* Release the bus: idle state SCL = 1, SDA = 1 */
     I2C_SCL_H();
     I2C_SDA_H();
 }
 
-/* ========== 起 始 信 号 (Start Condition) ========== */
-/**
- * @brief  产生 I2C 起始信号
- *
- *  时序要求: SCL 保持高电平期间, SDA 产生一个下降沿 (1→0)
- *
- *  为什么需要起始信号?
- *    总线空闲时 SCL 和 SDA 都是高电平. 从机如何知道 "通信要开始了"?
- *    在正常数据传输时, SDA 只在 SCL=0 时变化; SCL=1 时 SDA 必须稳定.
- *    所以当从机看到 "SCL=1 时 SDA 从 1 变成了 0"——这违反正常规则——
- *    就知道: 哦! 这是起始信号, 准备接收数据!
- *
- *  SCL:  ──────────────┐        ┌──
- *                       └────────┘
- *  SDA:  ─────┐              ┌────────
- *             └──────────────┘
- *          ↑ 起始: SDA↓ 发生在 SCL=1 期间
- */
+/** @brief Generate I2C start condition (SDA falling edge while SCL high). */
 void I2C_Start(void)
 {
-    /* 确保初始状态: SDA 和 SCL 都高 (总线空闲, 准备发出起始信号) */
     I2C_SDA_H();
     I2C_SCL_H();
-    I2C_Delay();        /* 延时, 让从机有时间检测到当前状态 */
+    I2C_Delay();
 
-    /* 核心动作: SCL 高电平期间, 把 SDA 拉低 → 这就是起始信号! */
     I2C_SDA_L();
-    I2C_Delay();        /* 从机检测到起始信号, 准备接收后续数据 */
+    I2C_Delay();
 
-    /* 拉低 SCL, 为接下来发送数据做准备
-     * (数据必须在 SCL=0 时变化, SCL=1 时采样) */
     I2C_SCL_L();
     I2C_Delay();
 }
 
-/* ========== 停 止 信 号 (Stop Condition) ========== */
-/**
- * @brief  产生 I2C 停止信号
- *
- *  时序要求: SCL 保持高电平期间, SDA 产生一个上升沿 (0→1)
- *
- *  从机看到 "SCL=1 时 SDA 从 0 变成了 1" 就知道通信结束了.
- *
- *  SCL:  ────────┐        ┌──────────────
- *                 └────────┘
- *  SDA:  ─────┐                    ┌──────
- *             └────────────────────┘
- *                              ↑ 停止: SDA↑ 发生在 SCL=1 期间
- */
+/** @brief Generate I2C stop condition (SDA rising edge while SCL high). */
 void I2C_Stop(void)
 {
-    /* 先把 SDA 拉低 (为上升沿做准备) */
     I2C_SDA_L();
     I2C_Delay();
 
-    /* 拉高 SCL, 此时 SCL=1, SDA=0 */
     I2C_SCL_H();
     I2C_Delay();
 
-    /* 核心动作: SCL 高电平期间, 释放 SDA (SDA: 0→1) → 停止信号! */
     I2C_SDA_H();
     I2C_Delay();
-
-    /* 总线回到空闲状态: SCL=1, SDA=1 */
 }
 
-/* ========== 发 送 一 个 字 节 ========== */
 /**
- * @brief  向从机发送 1 字节数据 (MSB 在前)
- * @param  data: 要发送的 8 位数据
- *
- *  I2C 规定: 先发送最高位 (MSB, Most Significant Bit, bit7),
- *            依次到最低位 (LSB, bit0).
- *
- *  发送每一位的步骤:
- *    [1] SCL=0 期间 → 把当前 bit 放到 SDA 上 (0 或 1)
- *    [2] 延时 → 确保 SDA 电平稳定
- *    [3] SCL 拉高 → 从机在 SCL 上升沿采样数据
- *    [4] 延时 → SCL 维持高电平, 给从机足够的采样时间
- *    [5] SCL 拉低 → 准备发送下一位
- *
- *  每个字节发送完毕后, 主机会释放 SDA 并发出第 9 个 SCL 脉冲,
- *  让从机回复 1 bit 应答信号 (ACK/NAK). 这一步由 I2C_WaitAck() 完成.
+ * @brief  Transmit one byte, MSB first.
+ * @param  data: byte to send
  */
 void I2C_SendByte(uint8_t data)
 {
     uint8_t i;
 
-    /* 逐位发送, 从最高位 bit7 开始 */
     for (i = 0; i < 8; i++)
     {
-        /* 步骤 1: SCL=0 期间, 把当前最高位放到 SDA 上 */
-        if (data & 0x80)        /* 0x80 = 10000000, 检查 bit7 是否为 1 */
-            I2C_SDA_H();        /* 当前 bit = 1 → 释放 SDA (上拉电阻拉高) */
+        if (data & 0x80)        /* bit7 = 1 */
+            I2C_SDA_H();
         else
-            I2C_SDA_L();        /* 当前 bit = 0 → 拉低 SDA */
+            I2C_SDA_L();
 
-        data <<= 1;             /* 左移一位, 下一个 bit 移到 bit7 位置 */
+        data <<= 1;
 
-        /* 步骤 2: 延时, 让 SDA 电平稳定下来 */
         I2C_Delay();
-
-        /* 步骤 3: SCL 拉高 → 从机在上升沿读取 SDA 上的数据 */
-        I2C_SCL_H();
-        I2C_Delay();            /* 步骤 4: 保持 SCL 高电平足够时间 */
-
-        /* 步骤 5: SCL 拉低 → 准备发送下一个 bit */
+        I2C_SCL_H();            /* slave samples on SCL rising edge */
+        I2C_Delay();
         I2C_SCL_L();
         I2C_Delay();
     }
 }
 
-/* ========== 等 待 从 机 应 答 ========== */
 /**
- * @brief  等待从机回复 ACK (应答) 信号
- * @return 0 = 从机回复了 ACK (通信正常)
- *         1 = 从机回复了 NAK (通信异常, 如地址错误/设备不存在)
- *
- *  ★ 这是学习 I2C 最重要的概念之一: 应答机制
- *
- *  I2C 每发送 1 字节后, 接收方必须在第 9 个时钟脉冲回复:
- *    - ACK (0): "我收到了, 继续发送下一个字节!"
- *    - NAK (1): "我没收到/我不认识你/我不想再收了"
- *
- *  应答时序:
- *    发送方(主机): 在第 9 个时钟释放 SDA (让从机来控制)
- *    接收方(从机): 在第 9 个时钟的 SCL 上升沿后把 SDA 拉低 (ACK)
- *                  或不拉低 (NAK, SDA 保持高电平)
- *    主机: 在第 9 个 SCL 高电平期间读取 SDA 电平, 判断应答
- *
- *  为什么需要应答?
- *    没有应答机制的话, 主机不知道数据是否成功送达.
- *    就像你打电话, 如果对方不说话, 你不知道对方是否在听.
- *
- *  常见 NAK 原因:
- *    1. 从机地址写错了 (比如给 0x68 发送 0x69)
- *    2. 设备没焊好/没上电/接线断了
- *    3. 上拉电阻缺失 (SDA 无法回到高电平)
- *    4. 时序太快, 从机来不及反应
+ * @brief  Wait for slave ACK on the 9th SCL clock.
+ * @return 0 = ACK received, 1 = NAK (device absent, wrong address, ...)
  */
 uint8_t I2C_WaitAck(void)
 {
     uint8_t ack;
 
-    /* 步骤 1: 释放 SDA → 让从机来控制这根线
-     * (主机设 SDA=1 → NMOS 截止 → 上拉电阻把 SDA 拉高 →
-     *  从机如果想回复 ACK, 会导通自己的 NMOS 把 SDA 拉低) */
+    /* Release SDA so the slave can pull it low for ACK */
     I2C_SDA_H();
     I2C_Delay();
 
-    /* 步骤 2: 发出第 9 个时钟脉冲 (SCL 上升沿) */
     I2C_SCL_H();
     I2C_Delay();
 
-    /* 步骤 3: 在 SCL=1 期间, 读取 SDA 的电平
-     *   SDA = 0 → 从机拉低了 → ACK! 太好了!
-     *   SDA = 1 → 从机没拉 → NAK... 有问题! */
     ack = I2C_SDA_READ();
 
-    /* 步骤 4: 拉低 SCL, 结束第 9 个时钟脉冲 */
     I2C_SCL_L();
     I2C_Delay();
 
-    return ack;  /* 0=ACK(成功), 1=NAK(失败) */
+    return ack;
 }
 
-/* ========== 读 取 一 个 字 节 ========== */
 /**
- * @brief  从从机读取 1 字节数据 (MSB 在前)
- * @param  ack: 主机读完这个字节后回复什么?
- *             0 = 回复 ACK  ("我还要继续读!")
- *             1 = 回复 NAK  ("这是最后一个字节, 不要了!")
- * @return 读取到的 8 位数据
- *
- *  读取和发送的区别:
- *    - 发送: 主机控制 SDA, 从机读取
- *    - 接收: 从机控制 SDA, 主机读取
- *
- *  主机能控制的是: SCL 时钟 + 读完后的应答位
- *
- *  典型读取流程 (读 N 个字节):
- *    第 1 ~ N-1 字节: I2C_ReadByte(0) → 主机回复 ACK, 表示"继续"
- *    第 N 个字节:     I2C_ReadByte(1) → 主机回复 NAK, 表示"够了, 停止"
- *
- *  读取每一位的步骤:
- *    [1] SCL=0 时主机释放 SDA → 从机把数据放到 SDA
- *    [2] SCL 拉高 → 从机保持数据, 主机读取 SDA 电平
- *    [3] SCL 拉低 → 准备读取下一位
+ * @brief  Receive one byte, MSB first.
+ * @param  ack: ACK to send after the byte (0 = ACK, 1 = NAK).
+ *              Send NAK after the final byte of a read sequence.
+ * @return received byte
  */
 uint8_t I2C_ReadByte(uint8_t ack)
 {
     uint8_t i;
-    uint8_t data = 0;  /* 存放读取到的 8 位数据 */
+    uint8_t data = 0;
 
-    /* 步骤 1: 释放 SDA, 让从机来控制数据线
-     * 主机设 SDA=1 → NMOS 截止 → 从机可以把 SDA 拉低 (发 0) 或不拉 (发 1) */
+    /* Release SDA so the slave can drive the data line */
     I2C_SDA_H();
     I2C_Delay();
 
-    /* 逐位读取, 最高位 (bit7) 先到 */
     for (i = 0; i < 8; i++)
     {
-        data <<= 1;         /* 左移一位, 为新 bit 腾出位置 */
+        data <<= 1;
 
-        /* 步骤 2: SCL 拉高 → 从机在 SCL 上升沿把数据放到 SDA 上 */
         I2C_SCL_H();
         I2C_Delay();
 
-        /* 步骤 3: 在 SCL=1 期间, 主机读取 SDA 电平 */
-        if (I2C_SDA_READ())     /* SDA=1 → 当前 bit = 1 */
-            data |= 0x01;        /* 把最低位置 1 */
-        /* 否则 bit = 0, data 当前位已经是 0 了 (左移后 LSB=0) */
+        if (I2C_SDA_READ())     /* sample data while SCL high */
+            data |= 0x01;
 
-        /* 步骤 4: SCL 拉低 → 准备读下一位 */
         I2C_SCL_L();
         I2C_Delay();
     }
 
-    /* ===== 第 9 个时钟: 主机发送应答位 ===== */
-    /* 读完 8 bit 后, 主机必须告诉从机: 要不要继续发? */
+    /* 9th clock: send ACK (continue) or NAK (last byte) */
     if (ack)
-        I2C_SDA_H();    /* NAK: 释放 SDA (保持高电平) → "够了, 别再发了" */
+        I2C_SDA_H();
     else
-        I2C_SDA_L();    /* ACK: 拉低 SDA → "我收到了, 继续发下一个字节!" */
+        I2C_SDA_L();
 
     I2C_Delay();
-    I2C_SCL_H();        /* SCL 上升沿, 从机在此采样应答位 */
+    I2C_SCL_H();
     I2C_Delay();
-    I2C_SCL_L();        /* 拉低 SCL, 结束应答时钟 */
+    I2C_SCL_L();
     I2C_Delay();
 
     return data;

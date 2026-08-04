@@ -1,322 +1,148 @@
 #include "MPU6050.h"
 #include "i2c.h"
 
-/* ============================================================
- *                     MPU6050 驱 动 实 现
- * ============================================================
- *
- *  MPU6050 是一款 6 轴运动传感器, 内部包含:
- *    - 3 轴加速度计  (测量线性加速度, 包括重力) → 量程 ±2/4/8/16g
- *    - 3 轴陀螺仪    (测量旋转角速度)            → 量程 ±250/500/1000/2000 °/s
- *    - 1 个温度传感器 (用于内部补偿, 精度不高)
- *
- *  通过 I2C 总线与 STM32 通信, 所有配置和读取都通过读写寄存器完成.
- *  本文件封装了 "单寄存器写" 和 "多寄存器连续读" 两个基础操作,
- *  以及上层的初始化、数据读取和物理量转换函数.
- *
- *  I2C 通信回顾 (与 MPU6050 的约定):
- *    写寄存器: [S]→[ADDR+W]→[寄存器地址]→[数据]→[P]
- *    读寄存器: [S]→[ADDR+W]→[寄存器地址]→[S]→[ADDR+R]→[读数据]→[P]
- *
- *    符号说明: S=起始信号, P=停止信号, ADDR+W=写地址, ADDR+R=读地址
- * ============================================================
+/**
+ * @file    MPU6050.c
+ * @brief   MPU6050 6-axis IMU driver (I2C).
+ * @note    3-axis accel (configured +/-16 g) + 3-axis gyro (+/-2000 deg/s)
+ *          + temperature. Register access via soft I2C (i2c.h):
+ *          write [S][A+W][reg][data][P], read [S][A+W][reg][S][A+R][data][P].
  */
 
-/* ========== 底 层: 写 一 个 寄 存 器 ========== */
 /**
- * @brief  向 MPU6050 的某个寄存器写入 1 字节数据
- * @param  reg:   目标寄存器的地址 (0x00 ~ 0x7F)
- * @param  value: 要写入的值
- *
- *  I2C 总线上的完整通信过程:
- *
- *  SCL: ┐  ┌┐┌┐┌┐┌┐┌┐┌┐┌┐┌┐┌ ┌┐┌┐┌┐┌┐┌┐┌┐┌┐┌┐┌ ┌┐┌┐┌┐┌┐┌┐┌┐┌┐┌┐┌ ┐
- *       │  │││││││││││││││││ │││││││││││││││││ │││││││││││││││││ │
- *  SDA: ┘  ┘┘┘┘┘┘┘┘┘┘┘┘┘┘┘┘┘ ┘┘┘┘┘┘┘┘┘┘┘┘┘┘┘┘┘ ┘┘┘┘┘┘┘┘┘┘┘┘┘┘┘┘┘ ┘
- *       S  设备地址+W(1B) ACK 寄存器地址(1B) ACK 寄存器数据(1B) ACK P
- *
- *  第 1 步: 发送起始信号
- *  第 2 步: 发送 "7位从机地址 + 0(写)", MPU6050 收到后回复 ACK
- *  第 3 步: 发送 "寄存器地址", MPU6050 回复 ACK
- *  第 4 步: 发送 "要写入的数据", MPU6050 回复 ACK
- *  第 5 步: 发送停止信号, 结束本次传输
- *
- *  ★ 记忆口诀: "起始 → 找谁 → 写哪 → 写啥 → 结束"
+ * @brief  Write one byte to a register.
+ * @param  reg:   register address (0x00..0x7F)
+ * @param  value: value to write
  */
 void MPU6050_WriteReg(uint8_t reg, uint8_t value)
 {
-    I2C_Start();                                /* [1] 起始信号 */
+    I2C_Start();
 
-    I2C_SendByte(MPU6050_ADDR_WRITE);            /* [2] 发送: 设备地址 + 写方向 */
-    I2C_WaitAck();                               /*     等待 MPU6050 应答 */
+    I2C_SendByte(MPU6050_ADDR_WRITE);            /* addr + write */
+    I2C_WaitAck();
 
-    I2C_SendByte(reg);                           /* [3] 发送: 要写的寄存器地址 */
-    I2C_WaitAck();                               /*     等待应答 */
+    I2C_SendByte(reg);                           /* target register */
+    I2C_WaitAck();
 
-    I2C_SendByte(value);                         /* [4] 发送: 要写入的数据 */
-    I2C_WaitAck();                               /*     等待应答 */
+    I2C_SendByte(value);                         /* data */
+    I2C_WaitAck();
 
-    I2C_Stop();                                  /* [5] 停止信号 */
+    I2C_Stop();
 }
 
-/* ========== 底 层: 连 续 读 多 个 寄 存 器 ========== */
 /**
- * @brief  从 MPU6050 的某个寄存器开始, 连续读取多个字节
- * @param  reg:  起始寄存器地址
- * @param  buf:  存放读取数据的缓冲区指针
- * @param  len:  要读取的字节数
- *
- *  I2C 读寄存器比写寄存器多一个"方向切换"步骤:
- *
- *  第 1 步: 先用"写模式"告诉 MPU6050 我要读哪个寄存器
- *          [S] → [ADDR+W] → [寄存器地址] → [ACK]
- *
- *  第 2 步: 重新发起始信号, 切换到"读模式"开始接收数据
- *          [S] → [ADDR+R] → [读数据1→ACK] → [读数据2→ACK] → ... → [最后一字节→NAK] → [P]
- *
- *  为什么需要先写后读?
- *    MPU6050 内部有一个"当前寄存器指针". 每次复位后指针在 0x00.
- *    你先写一个寄存器地址给它, 它就把"指针"移到那个位置;
- *    然后你切换到读模式, 它就从指针位置开始往外送数据,
- *    而且每读一个字节, 指针自动 +1, 所以可以连续读!
- *    这是 I2C 的"自动递增"特性, 读取大量数据时非常高效.
- *
- *  ★ 关键细节: 读取最后一个字节时, 主机必须回复 NAK (不回复 ACK),
- *    这是 I2C 协议的约定——告诉从机 "这是最后一个字节, 别再发更多了".
- *
- *  ★ 记忆口诀: "起始 → 找谁写 → 从哪开始 → 重新起始 → 找谁读 → 收数据到完 → 结束"
+ * @brief  Read multiple bytes starting at reg (address auto-increments).
+ * @param  reg: start register address
+ * @param  buf: destination buffer
+ * @param  len: number of bytes to read
+ * @note   The final byte is acknowledged with NAK, per I2C protocol.
  */
 void MPU6050_ReadRegs(uint8_t reg, uint8_t *buf, uint8_t len)
 {
     uint8_t i;
 
-    /* ===== 第 1 步: 写模式, 告诉 MPU6050 我要从哪个寄存器开始读 ===== */
+    /* write mode: set the internal register pointer */
     I2C_Start();
-    I2C_SendByte(MPU6050_ADDR_WRITE);    /* 设备地址 + 写方向 (0) */
+    I2C_SendByte(MPU6050_ADDR_WRITE);
     I2C_WaitAck();
-    I2C_SendByte(reg);                   /* 起始寄存器地址 */
+    I2C_SendByte(reg);
     I2C_WaitAck();
 
-    /* ===== 第 2 步: 重新起始, 切换到读模式 ===== */
+    /* repeated start, switch to read mode */
     I2C_Start();
-    I2C_SendByte(MPU6050_ADDR_READ);     /* 设备地址 + 读方向 (1) */
+    I2C_SendByte(MPU6050_ADDR_READ);
     I2C_WaitAck();
 
-    /* ===== 第 3 步: 连续读取 len 个字节 ===== */
+    /* ACK all bytes except the last (NAK terminates the read) */
     for (i = 0; i < len; i++)
     {
-        /*
-         * 读取每个字节时, 主机需要决定回复什么:
-         *   - 如果不是最后一个字节 (i < len-1):
-         *     回复 ACK (0) → "收到了, 请继续发下一个!"
-         *   - 如果是最后一个字节 (i == len-1):
-         *     回复 NAK (1) → "够了, 这是最后一个!"
-         *
-         * I2C_ReadByte 的参数就是应答值:
-         *   0 = 回复 ACK,  1 = 回复 NAK
-         */
         buf[i] = I2C_ReadByte(i == len - 1 ? 1 : 0);
     }
 
     I2C_Stop();
 }
 
-/* ========== 初 始 化 MPU6050 ========== */
 /**
- * @brief  初始化 MPU6050 传感器
- *
- *  上电后 MPU6050 默认处于"睡眠模式" (Sleep Mode),
- *  所有传感器都关闭以省电. 我们必须:
- *
- *  1. 唤醒芯片           → 写 PWR_MGMT_1 = 0x00
- *  2. 设置采样率         → 写 SMPLRT_DIV, 决定数据刷新频率
- *  3. 配置数字低通滤波器  → 写 CONFIG, 滤除传感器的高频噪声
- *  4. 设置陀螺仪量程     → 写 GYRO_CONFIG, ±2000°/s
- *  5. 设置加速度计量程   → 写 ACCEL_CONFIG, ±16g
- *
- *  采样率计算:
- *    MPU6050 内部陀螺仪采样率 = 8kHz (不开 DLPF) 或 1kHz (开 DLPF)
- *    最终数据输出率 = 内部采样率 / (1 + SMPLRT_DIV)
- *
- *    我们配置: CONFIG=0x06 (DLPF 开启, 陀螺仪带宽 5Hz)
- *            → 内部采样率 = 1kHz
- *            → SMPLRT_DIV = 7
- *            → 输出率 = 1000 / (1+7) = 125Hz
- *    这意味着每 8ms 刷新一次数据, 对大多数应用足够了.
+ * @brief  Initialize MPU6050: wake-up, 125 Hz output rate, DLPF 5 Hz,
+ *         gyro +/-2000 deg/s, accel +/-16 g.
  */
 void MPU6050_Init(void)
 {
-    /* 第 1 步: 唤醒 MPU6050
-     * PWR_MGMT_1 (0x6B) 的 bit6 是 SLEEP 位:
-     *   bit6=1 → 睡眠模式 (默认), 传感器关闭
-     *   bit6=0 → 正常工作模式
-     * 写入 0x00 将所有位清零 = 唤醒 + 使用内部 8MHz 振荡器 */
+    /* wake up: clear SLEEP bit of PWR_MGMT_1 (0x6B), use internal clock */
     MPU6050_WriteReg(MPU6050_REG_PWR_MGMT_1, 0x00);
 
-    /* 第 2 步: 设置采样率分频器
-     * SMPLRT_DIV = 7  → 输出率 = 1kHz / (1+7) = 125Hz */
+    /* sample rate = 1 kHz / (1 + 7) = 125 Hz */
     MPU6050_WriteReg(MPU6050_REG_SMPLRT_DIV, 0x07);
 
-    /* 第 3 步: 配置数字低通滤波器 (DLPF)
-     * CONFIG (0x1A) 的低 3 位 (bit2:0) 设置 DLPF 带宽:
-     *   0x06 = 110b → 陀螺仪输出带宽约 5Hz (最平滑, 滤除大量噪声)
-     *   0x00 = 000b → DLPF 关闭 (带宽 ~256Hz, 噪声大但响应快)
-     *
-     * 数字低通滤波器的作用:
-     *   想象你在摇晃一杯水——水面波动很快 (高频噪声).
-     *   DLPF 就像你的手, 滤掉细碎抖动, 只保留缓慢的倾斜变化.
-     *   带宽越小 = 滤波越狠 = 数据越平滑但响应越慢.
-     *
-     * 对于学习实验, 选带宽 5Hz (0x06) 数据会很平稳.
-     * 做四轴飞行器的话, 带宽不能这么低 (会感觉 "延迟" 太大).
-     */
+    /* DLPF: gyro bandwidth ~5 Hz (smooth output) */
     MPU6050_WriteReg(MPU6050_REG_CONFIG, 0x06);
 
-    /* 第 4 步: 设置陀螺仪量程
-     * GYRO_CONFIG (0x1B) 的 bit4:3 设置满量程:
-     *   0x00 = ±250 °/s   (精度最高, 范围最小)
-     *   0x08 = ±500 °/s
-     *   0x10 = ±1000 °/s
-     *   0x18 = ±2000 °/s  (范围最大, 适合快速旋转)
-     *
-     * 为什么选 ±2000°/s?
-     *   学习阶段先选最大量程 → 不容易溢出,
-     *   做剧烈晃动实验时数据也不会 "顶到头".
-     */
+    /* gyro full-scale: +/-2000 deg/s (bit4:3 = 11) */
     MPU6050_WriteReg(MPU6050_REG_GYRO_CONFIG, 0x18);
 
-    /* 第 5 步: 设置加速度计量程
-     * ACCEL_CONFIG (0x1C) 的 bit4:3 设置满量程:
-     *   0x00 = ±2g   (精度最高)
-     *   0x08 = ±4g
-     *   0x10 = ±8g
-     *   0x18 = ±16g  (范围最大)
-     *
-     * 什么是 "g"? 1g = 地球表面的重力加速度 = 9.8 m/s².
-     * 当芯片水平放置时, Z 轴应该读到 ≈ +1g (地球引力).
-     * 选 ±16g 可以让传感器在剧烈震动时也不会溢出数据.
-     */
+    /* accel full-scale: +/-16 g (bit4:3 = 11) */
     MPU6050_WriteReg(MPU6050_REG_ACCEL_CONFIG, 0x18);
 }
 
-/* ========== 验 证 I2C 通 信 ========== */
 /**
- * @brief  读取 MPU6050 的 WHO_AM_I 寄存器来验证通信是否正常
- * @return 读到的值 (正常情况下应该是 0x68)
- *
- *  这是调试 MPU6050 的第一步! 如果这个函数返回的不是 0x68:
- *    1. 检查 SDA/SCL 接线 (有没有接反?)
- *    2. 检查电源 (3.3V 和 GND 接好了吗?)
- *    3. 检查上拉电阻 (模块自带的话, 用万用表量一下 SDA 对 VCC 是否是 4.7kΩ 左右)
- *    4. 检查 AD0 引脚 (接地了吗? 接 GND → 地址 0x68)
- *
- *  如果这个函数返回 0x68, 恭喜! I2C 通信正常, 后面的读写都没问题!
+ * @brief  Read the WHO_AM_I register to verify I2C communication.
+ * @return register value (0x68 when the bus and address are correct)
+ * @note   Any other value indicates wiring, power, address or pull-up
+ *         problems (e.g. SDA/SCL swapped, missing 4.7k pull-up, AD0 not
+ *         tied to GND).
  */
 uint8_t MPU6050_ReadID(void)
 {
     uint8_t id;
 
-    /* WHO_AM_I 是只读寄存器, 上电后硬件自动填入 0x68, 永不改变 */
     MPU6050_ReadRegs(MPU6050_REG_WHO_AM_I, &id, 1);
 
     return id;
 }
 
-/* ========== 读 取 全 部 传 感 器 原 始 数 据 ========== */
 /**
- * @brief  一次性读取 MPU6050 全部 14 字节传感器数据
- * @param  data: 存放原始数据的结构体指针
- *
- *  MPU6050 的传感器数据从地址 0x3B 开始, 连续存放 14 字节:
- *
- *  地址     │ 0x3B │ 0x3C │ 0x3D │ 0x3E │ 0x3F │ 0x40 │ 0x41 │
- *  数据     │ AX_H │ AX_L │ AY_H │ AY_L │ AZ_H │ AZ_L │ TP_H │
- *  ─────────┼──────┼──────┼──────┼──────┼──────┼──────┼──────┤
- *  地址     │ 0x42 │ 0x43 │ 0x44 │ 0x45 │ 0x46 │ 0x47 │ 0x48 │
- *  数据     │ TP_L │ GX_H │ GX_L │ GY_H │ GY_L │ GZ_H │ GZ_L │
- *
- *  AX = 加速度 X, AY = 加速度 Y, AZ = 加速度 Z
- *  TP = 温度, GX/GY/GZ = 陀螺仪 X/Y/Z
- *  _H = 高字节 (High),  _L = 低字节 (Low)
- *
- *  每个轴是 16 位有符号整数 (int16_t), 大端序 (高字节在前).
- *  拼接方法: (高字节 << 8) | 低字节
- *
- *  ★ 为什么要一次性读完 14 字节而不是分开读?
- *    1. I2C 支持"自动递增" → 硬件指针自动移动, 不用反复发寄存器地址
- *    2. 保证所有数据来自同一个采样时刻 → 加速度和角速度是同步的
- *    3. 效率更高 → 一次 I2C 传输比多次传输省时间
+ * @brief  Read all 14 sensor bytes in one transaction (same sample
+ *         instant, auto-increment addressing).
+ * @param  data: raw data structure to fill
+ * @note   0x3B..0x48: AX, AY, AZ, T, GX, GY, GZ as H/L byte pairs,
+ *          big-endian, signed 16-bit.
  */
 void MPU6050_ReadRawData(MPU6050_RawData *data)
 {
-    uint8_t buf[14];  /* 临时存放 14 字节原始数据 */
+    uint8_t buf[14];
 
-    /* 从 0x3B (ACCEL_XOUT_H) 开始连续读 14 字节 */
+    /* 14 bytes starting at ACCEL_XOUT_H (0x3B) */
     MPU6050_ReadRegs(MPU6050_REG_ACCEL_XOUT_H, buf, 14);
 
-    /*
-     * 拼接 16 位数据: 高字节 << 8 | 低字节
-     *
-     * 例: buf[0]=0x12, buf[1]=0x34 → 0x12 << 8 | 0x34 = 0x1234
-     *
-     * 注意: 这是有符号数! 如果最高位是 1 (数值 > 32767),
-     *       编译器会将它解释为负数. 例如:
-     *       0xFFCE → int16_t → -50 (表示 -50 的加速度原始值)
-     */
-    data->Accel_X = (int16_t)((buf[0]  << 8) | buf[1]);   /* AX: buf[0]=H, buf[1]=L */
-    data->Accel_Y = (int16_t)((buf[2]  << 8) | buf[3]);   /* AY: buf[2]=H, buf[3]=L */
-    data->Accel_Z = (int16_t)((buf[4]  << 8) | buf[5]);   /* AZ: buf[4]=H, buf[5]=L */
-    data->Temp    = (int16_t)((buf[6]  << 8) | buf[7]);   /* TP: buf[6]=H, buf[7]=L */
-    data->Gyro_X  = (int16_t)((buf[8]  << 8) | buf[9]);   /* GX: buf[8]=H, buf[9]=L */
-    data->Gyro_Y  = (int16_t)((buf[10] << 8) | buf[11]);  /* GY: buf[10]=H, buf[11]=L */
-    data->Gyro_Z  = (int16_t)((buf[12] << 8) | buf[13]);  /* GZ: buf[12]=H, buf[13]=L */
+    /* merge H/L byte pairs into signed 16-bit values */
+    data->Accel_X = (int16_t)((buf[0]  << 8) | buf[1]);   /* buf[0]=H, buf[1]=L */
+    data->Accel_Y = (int16_t)((buf[2]  << 8) | buf[3]);
+    data->Accel_Z = (int16_t)((buf[4]  << 8) | buf[5]);
+    data->Temp    = (int16_t)((buf[6]  << 8) | buf[7]);
+    data->Gyro_X  = (int16_t)((buf[8]  << 8) | buf[9]);
+    data->Gyro_Y  = (int16_t)((buf[10] << 8) | buf[11]);
+    data->Gyro_Z  = (int16_t)((buf[12] << 8) | buf[13]);
 }
 
-/* ========== 原 始 值 转 换 为 物 理 值 ========== */
 /**
- * @brief  将传感器原始数据转换为实际的物理量
- * @param  raw: 原始数据 (16 位有符号整数)
- * @param  phy: 转换结果 (浮点数, 带物理单位)
- *
- *  转换公式:
- *    加速度 (g)  = 原始值 / ACCEL_SCALE
- *    陀螺仪 (°/s) = 原始值 / GYRO_SCALE
- *    温度 (°C)    = 原始值 / 340.0 + 36.53
- *
- *  示例:
- *    水平放置 MPU6050, Z 轴受重力影响应读到 +1g:
- *      → 原始值 ≈ 2048
- *      → 2048 / 2048.0 = 1.00g  ← 符合预期!
- *
- *    将传感器绕 Z 轴顺时针旋转 90°/s:
- *      → 原始值 ≈ 90 * 16.4 = 1476
- *      → 1476 / 16.4 = 90°/s  ← 符合预期!
- *
- *  注意: 浮点运算在 STM32F103 (Cortex-M3, 无硬件 FPU) 上比较慢,
- *       如果不需要显示浮点值, 可以在 OLED 上直接显示原始值.
- *       本函数主要用来演示转换思想.
+ * @brief  Convert raw sensor values to physical units.
+ * @param  raw: raw sensor data
+ * @param  phy: converted values (accel in g, gyro in deg/s, temp in degC)
+ * @note   temp (degC) = raw / 340.0 + 36.53; accel/gyro divide by the
+ *         LSB-per-unit factor of the configured full-scale ranges.
  */
 void MPU6050_ConvertToPhy(const MPU6050_RawData *raw, MPU6050_PhyData *phy)
 {
-    /* 加速度: 原始值 ÷ 量程因子 = 以 g 为单位的值 */
+    /* accel: raw / LSB-per-g factor */
     phy->Accel_X_g = raw->Accel_X / MPU6050_ACCEL_SCALE;
     phy->Accel_Y_g = raw->Accel_Y / MPU6050_ACCEL_SCALE;
     phy->Accel_Z_g = raw->Accel_Z / MPU6050_ACCEL_SCALE;
 
-    /* 陀螺仪: 原始值 ÷ 量程因子 = 以 °/s 为单位的值 */
+    /* gyro: raw / LSB-per-(deg/s) factor */
     phy->Gyro_X_dps = raw->Gyro_X / MPU6050_GYRO_SCALE;
     phy->Gyro_Y_dps = raw->Gyro_Y / MPU6050_GYRO_SCALE;
     phy->Gyro_Z_dps = raw->Gyro_Z / MPU6050_GYRO_SCALE;
 
-    /*
-     * 温度换算:
-     *   MPU6050 的温度传感器不是为高精度测温设计的,
-     *   主要用于陀螺仪的内部温度补偿.
-     *
-     *   数据手册给出的公式: Temperature(°C) = Temp_Raw / 340 + 36.53
-     *
-     *   其中 340 是灵敏度 (LSB/°C), 36.53 是 0°C 时的偏移.
-     *   实际精度大约 ±1°C, 只能粗略反映芯片温度 (通常约 30~40°C).
-     */
+    /* temp: sensitivity 340 LSB/degC, offset 36.53 degC */
     phy->Temp_C = raw->Temp / 340.0f + 36.53f;
 }

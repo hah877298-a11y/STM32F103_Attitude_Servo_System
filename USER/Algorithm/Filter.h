@@ -3,97 +3,51 @@
 
 #include "stm32f10x.h"
 
-/* ============================================================
- *          一 阶 互 补 滤 波 器 头 文 件
- * ============================================================
+/**
+ * @file  Filter.h
+ * @brief First-order complementary filter for attitude estimation
  *
- *  解决的问题:
- *    如何从 MPU6050 的加速度计和陀螺仪数据中算出可靠的姿态角?
- *
- *  两种传感器的优缺点:
- *    ┌──────────┬────────────────────┬────────────────────┐
- *    │  传感器  │       优点         │       缺点         │
- *    ├──────────┼────────────────────┼────────────────────┤
- *    │ 加速度计 │ 长期准确, 静止时    │ 运动时受振动/加速  │
- *    │          │ 能精确测量重力方向  │ 度干扰, 噪声大     │
- *    ├──────────┼────────────────────┼────────────────────┤
- *    │ 陀螺仪   │ 短期准确, 不受振动  │ 积分误差累积,      │
- *    │          │ 干扰, 响应快       │ 长时间会漂移       │
- *    └──────────┴────────────────────┴────────────────────┘
- *
- *  互补滤波的核心思想:
- *    各取所长 —— 陀螺仪主导短期变化, 加速度计修正长期漂移.
- *
- *  公式:
- *    angle = α × (angle + gyro × dt) + (1 - α) × accel_angle
- *
- *    其中:
- *      α (alpha)  : 滤波器系数, 通常取 0.96 ~ 0.98
- *                    α 越大 → 越信陀螺仪 → 响应快但漂移大
- *                    α 越小 → 越信加速度计 → 稳定但响应慢
- *
- *      gyro       : 陀螺仪角速度 (°/s)
- *      dt         : 两次计算的时间间隔 (s)
- *      accel_angle: 从加速度计推算的角度 (°)
- *      angle      : 融合后的角度 (°)
- *
- *  通俗理解:
- *    想象你在开车, GPS (加速度计) 告诉你大致位置, 但不精确.
- *    车速表 (陀螺仪) 告诉你走了多远, 但长时间会累积误差.
- *    互补滤波 = 大部分相信车速表, 时不时用 GPS 校准一下.
- *
- *  为什么叫 "一阶互补"?
- *    加速度计数据通过低通滤波器 (滤掉高频振动噪声)
- *    陀螺仪数据通过高通滤波器 (滤掉长期漂移)
- *    两者加在一起 → 全频段覆盖 → "互补"
- *
- *  注意: 本实现只计算 pitch (俯仰角) 和 roll (横滚角),
- *        不计算 yaw (偏航角), 因为 MPU6050 的 Z 轴陀螺
- *        没有磁力计辅助, yaw 会一直漂移.
- * ============================================================
+ * Fuses gyro integration (short-term) with accel-derived angles
+ * (long-term) to reject drift and vibration noise. Pitch/roll only.
  */
 
-/* ========== 滤 波 器 结 构 体 ========== */
 /**
- * @brief  互补滤波器实例
- *
- *  每个需要滤波的角度 (如 pitch, roll) 独立使用一个实例.
- *  把状态封装在结构体里, 便于管理多个滤波器.
+ * @brief  Complementary filter instance (one per axis)
  */
 typedef struct
 {
-    float angle;        /* 当前滤波后的角度 (°) */
-    float bias;         /* 陀螺仪零偏 (°/s) (暂未使用, 预留扩展) */
-    float alpha;        /* 滤波器系数 (0~1, 典型值 0.98) */
-    float dt;           /* 采样间隔 (s), 如 0.01 = 10ms */
+    float angle;        /* fused angle (deg) */
+    float bias;         /* gyro bias (deg/s), reserved */
+    float alpha;        /* filter coefficient (0~1, typical 0.98) */
+    float dt;           /* sampling interval (s) */
 } ComplementaryFilter;
 
-/* ========== 姿 态 角 结 构 体 ========== */
 /**
- * @brief  完整的姿态角数据
- *
- *  pitch: 俯仰角, 绕 X 轴旋转 (点头), 范围 -90° ~ +90°
- *  roll:  横滚角, 绕 Y 轴旋转 (歪头), 范围 -180° ~ +180°
- *  yaw:   偏航角, 绕 Z 轴旋转 (转头), 无磁力计无法精确测量
+ * @brief  Fused attitude angles
  */
 typedef struct
 {
-    float pitch;    /* 俯仰角 (°) */
-    float roll;     /* 横滚角 (°) */
-    float yaw;      /* 偏航角 (°), 本工程不使用 */
+    float pitch;    /* pitch angle (deg) */
+    float roll;     /* roll angle (deg) */
+    float yaw;      /* yaw angle (deg), not tracked */
 } AttitudeAngle;
-
-/* ========== 对 外 接 口 ========== */
 
 void Filter_Init(ComplementaryFilter *f, float alpha, float dt);
 
-/* 从加速度计原始值计算角度 (直接用原始值, 避免浮点转换开销) */
+/**
+ * @brief  Compute pitch/roll from raw accelerometer data
+ */
 void Filter_AccelAngle(int16_t ax, int16_t ay, int16_t az, float *pitch, float *roll);
 
-/* 互补滤波更新: 输入陀螺角速度 + 加速度角度, 输出融合角度 */
+/**
+ * @brief  Single-axis complementary filter update
+ * @return Fused angle (deg)
+ */
 float Filter_Update(ComplementaryFilter *f, float gyro_rate, float accel_angle);
 
-/* 便捷函数: 一次调用完成 pitch/roll 的滤波更新 */
+/**
+ * @brief  Fuse pitch and roll in a single call
+ */
 void Filter_UpdateAttitude(ComplementaryFilter *pitch_f, ComplementaryFilter *roll_f,
                            float gx, float gy, float gz,
                            float acc_pitch, float acc_roll,

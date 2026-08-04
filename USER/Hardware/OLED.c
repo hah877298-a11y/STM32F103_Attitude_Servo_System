@@ -1,52 +1,16 @@
 #include "OLED.h"
 #include "i2c.h"
 
-/* ============================================================
- *                  SSD1306 OLED 显 示 驱 动 实 现
- * ============================================================
- *
- *  显示原理:
- *    SSD1306 的 GDDRAM (显存) 按"页"组织:
- *      - 每页高 8 像素, 共 8 页 (0~7)
- *      - 每页宽 128 列 (0~127)
- *      - 写一个字节 = 控制某一列的 8 个竖排像素
- *      - 字节的 bit0 (LSB) = 该列最上面的像素
- *        bit7 (MSB) = 该列最下面的像素
- *
- *  例: 向页0 列0 写入 0x0F (00001111):
- *      点亮该列最上面 4 个像素, 下面 4 个像素熄灭.
- *
- *  I2C 通信特点 (与 MPU6050 的重要区别):
- *    SSD1306 没有"寄存器地址"概念!
- *    每次传输第一个字节是"控制字节":
- *      0x00 → 后续字节是"命令" (配置芯片行为)
- *      0x40 → 后续字节是"数据" (写入 GDDRAM 显示)
- * ============================================================
+/**
+ * @file    OLED.c
+ * @brief   SSD1306 OLED display driver (128x64, I2C).
+ * @note    GDDRAM: 8 pages x 128 columns; one byte = one 8-pixel column
+ *          (bit0 = top). First byte of each transfer is the control byte:
+ *          0x00 = command, 0x40 = data. Device address 0x3C (write 0x78).
  */
 
-/* ============================================================
- *         6 × 8 ASCII 字 体 表 (字符 0x20 ' ' ~ 0x7E '~')
- * ============================================================
- *
- *  每个字符占 6 列 × 8 行 = 6 字节.
- *  每字节描述一列像素, LSB 在上, MSB 在下.
- *
- *  例: 字符 '!' (0x21) 的 6 个字节:
- *      0x00, 0x00, 0x5F, 0x00, 0x00, 0x00
- *
- *      列0: 0x00 = 00000000  (全灭)
- *      列1: 0x00 = 00000000  (全灭)
- *      列2: 0x5F = 01011111  (点亮大部分像素, 形成竖线)
- *      列3: 0x00 = 00000000  (全灭, 字符间距)
- *      列4: 0x00 = 00000000
- *      列5: 0x00 = 00000000
- *
- *  字体表中每 6 个字节描述一个字符.
- *  字符 ' ' (0x20) 在索引 0, '!' (0x21) 在索引 6, 以此类推.
- *  访问公式: 字符 ch 的字体数据起始位置 = (ch - 0x20) * 6
- *
- *  注意: 最后两列通常留空或很窄, 作为字符之间的自然间距.
- */
+/** 6x8 ASCII font (0x20..0x7E), 6 bytes per character.
+ *  One byte = one column, LSB = top pixel; index = (ch - 0x20) * 6. */
 static const uint8_t Font6x8[][6] =
 {
     /* 0x20 ' ' */ { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
@@ -151,48 +115,28 @@ static const uint8_t Font6x8[][6] =
     /* 0x7E '~' */ { 0x08, 0x04, 0x08, 0x10, 0x08, 0x00 },
 };
 
-/* ============================================================
- *             底 层 : 向 OLED 发 送 命 令
- * ============================================================
- */
 /**
- * @brief  向 SSD1306 发送一个命令字节
- * @param  cmd: 命令字节 (如 0xAE=关显示, 0xAF=开显示)
- *
- *  I2C 通信序列:
- *    [Start] → [0x78 (OLED写地址)] → [0x00 (控制字节: 命令)] → [命令值] → [Stop]
- *
- *  与 MPU6050 的关键区别:
- *    MPU6050: 第一个数据字节 = 寄存器地址
- *    SSD1306: 第一个数据字节 = 控制字节 (0x00=命令, 0x40=数据)
- *
- *  这种设计是因为 SSD1306 的命令和数据走"同一条通道"但不共享地址空间,
- *  需要用控制字节来区分.
+ * @brief  Send one command byte to the controller.
+ * @param  cmd: command byte
+ * @note   Transfer: [S][0x78 addr+W][0x00 command][cmd][P]
  */
 static void OLED_WriteCmd(uint8_t cmd)
 {
     I2C_Start();
-    I2C_SendByte(OLED_ADDR_WRITE);   /* 0x78: OLED 7位地址 + 写方向 */
+    I2C_SendByte(OLED_ADDR_WRITE);   /* 0x78: addr + write */
     I2C_WaitAck();
-    I2C_SendByte(OLED_CTRL_CMD);     /* 0x00: 控制字节, 表示"后面是命令" */
+    I2C_SendByte(OLED_CTRL_CMD);     /* 0x00: control byte = command */
     I2C_WaitAck();
-    I2C_SendByte(cmd);               /* 具体命令值 */
+    I2C_SendByte(cmd);
     I2C_WaitAck();
     I2C_Stop();
 }
 
-/* ============================================================
- *             底 层 : 向 OLED 发 送 数 据 (写 入 显 存)
- * ============================================================
- */
 /**
- * @brief  向 SSD1306 发送多个数据字节 (批量写入更快)
- * @param  buf: 数据缓冲区
- * @param  len: 字节数
- *
- *  与上面的 OLED_WriteData 不同, 这个函数在一次 I2C 传输中连续发送多个字节.
- *  相比每个字节都 Start/Stop 一次, 批量写入效率高得多.
- *  I2C 序列: [S]→[0x78]→[0x40]→[data1]→[data2]→...→[dataN]→[P]
+ * @brief  Send multiple data bytes in a single I2C transaction.
+ * @param  buf: data buffer
+ * @param  len: byte count
+ * @note   Transfer: [S][0x78][0x40][data...][P]
  */
 static void OLED_WriteMultiData(const uint8_t *buf, uint8_t len)
 {
@@ -201,7 +145,7 @@ static void OLED_WriteMultiData(const uint8_t *buf, uint8_t len)
     I2C_Start();
     I2C_SendByte(OLED_ADDR_WRITE);
     I2C_WaitAck();
-    I2C_SendByte(OLED_CTRL_DATA);    /* 0x40: 后续都是数据! */
+    I2C_SendByte(OLED_CTRL_DATA);    /* 0x40: control byte = data */
     I2C_WaitAck();
 
     for (i = 0; i < len; i++)
@@ -213,132 +157,82 @@ static void OLED_WriteMultiData(const uint8_t *buf, uint8_t len)
     I2C_Stop();
 }
 
-/* ============================================================
- *               设 置 光 标 (显 存 写 入 位 置)
- * ============================================================
- */
 /**
- * @brief  设置 GDDRAM 的写入位置 (页地址 + 列地址)
- * @param  page: 页号 (0~7), 对应屏幕的行  page*8 ~ page*8+7
- * @param  col:  列号 (0~127), 对应屏幕的水平坐标
- *
- *  SSD1306 的 GDDRAM 写入是"先设位置, 再写数据"模式.
- *  设好页和列之后, 每写一个字节, 列地址自动 +1,
- *  所以可以连续写入而不用重复设置.
- *
- *  命令解释:
- *    0xB0 + page  →  设置页地址 (0xB0=页0, 0xB1=页1, ..., 0xB7=页7)
- *    0x00 + low   →  设置列地址的低 4 位
- *    0x10 + high  →  设置列地址的高 4 位
- *
- *  为什么列地址要拆成两个命令?
- *    SSD1306 的命令只有 8 位. 列地址需要 7 位 (0~127),
- *    所以分成低 4 位和高 3 位分别发送——这是芯片设计的历史限制.
+ * @brief  Set GDDRAM write position; the column pointer auto-increments
+ *         after each written byte.
+ * @param  page: page 0..7 (screen row = page * 8)
+ * @param  col:  column 0..127
  */
 void OLED_SetCursor(uint8_t page, uint8_t col)
 {
-    OLED_WriteCmd(0xB0 | (page & 0x07));        /* 页地址: 0xB0 ~ 0xB7 */
-    OLED_WriteCmd(0x00 | (col & 0x0F));          /* 列低 4 位 */
-    OLED_WriteCmd(0x10 | ((col >> 4) & 0x0F));   /* 列高 4 位 */
+    OLED_WriteCmd(0xB0 | (page & 0x07));        /* page address 0xB0..0xB7 */
+    OLED_WriteCmd(0x00 | (col & 0x0F));          /* column low nibble */
+    OLED_WriteCmd(0x10 | ((col >> 4) & 0x0F));   /* column high nibble */
 }
 
-/* ============================================================
- *                  初 始 化 OLED
- * ============================================================
- */
 /**
- * @brief  初始化 SSD1306 OLED 显示屏
- *
- *  SSD1306 上电后处于复位状态, 需要发送一系列命令来:
- *    1. 关闭显示 (配置期间不显示, 避免花屏)
- *    2. 设置时钟、复用比、COM 引脚配置
- *    3. 设置电荷泵 (3.3V 供电必须开启!)
- *    4. 设置显示方向 (正常/镜像)
- *    5. 打开显示
- *
- *  ★ 重要: 如果电荷泵不开启, 3.3V 供电的 OLED 不会亮!
- *    电荷泵把 3.3V 升压到 ~7.5V 驱动 OLED 面板.
- *    命令序列中的 0x8D, 0x14 就是开启电荷泵.
+ * @brief  Initialize SSD1306: clock, multiplex, segment remap, charge
+ *         pump, display on. Sequence per datasheet.
  */
 void OLED_Init(void)
 {
-    /*
-     * 上电后先延时一会儿, 等 OLED 内部电源稳定.
-     * SSD1306 数据手册建议等待 VDD 稳定后再发命令.
-     */
-    /*
-     * SSD1306 上电后 VDD 需要时间稳定 (数据手册要求等待 ≥100ms).
-     * 如果上电后立即发 I2C 命令, 芯片可能处于复位状态不响应.
-     * 这里延时约 300ms, 确保 OLED 内部电源和振荡器完全稳定.
-     */
+    /* ~300 ms power-on delay: VDD must be stable before I2C commands */
     {
         volatile uint32_t i;
         for (i = 0; i < 800000; i++) __NOP();
     }
 
-    /* ===== 基本配置序列 (按 SSD1306 数据手册推荐的初始化顺序) ===== */
+    OLED_WriteCmd(0xAE);    /* display off during configuration */
 
-    OLED_WriteCmd(0xAE);    /* 0xAE = 关闭显示 (先关掉, 配置完再开) */
+    OLED_WriteCmd(0x20);    /* addressing mode */
+    OLED_WriteCmd(0x02);    /*   page addressing */
 
-    OLED_WriteCmd(0x20);    /* 设置寻址模式 */
-    OLED_WriteCmd(0x02);    /*   0x02 = 页寻址模式 (最常用, 最直观) */
+    OLED_WriteCmd(0xA1);    /* segment remap (column 127 -> SEG0) */
+    OLED_WriteCmd(0xC8);    /* COM scan direction reversed */
+                            /* => (0,0) at top-left */
 
-    OLED_WriteCmd(0xA1);    /* 段重映射: 列 127 映射到 SEG0 → 左右镜像 */
-    OLED_WriteCmd(0xC8);    /* COM 扫描方向: 从 COM[N-1] 到 COM0 → 上下镜像 */
-                            /* 上面两条让坐标 (0,0) 在屏幕左上角, 符合直觉 */
+    OLED_WriteCmd(0x40);    /* display start line 0 */
 
-    OLED_WriteCmd(0x40);    /* 设置显示起始行 = 第 0 行 (从最顶部开始) */
+    OLED_WriteCmd(0x81);    /* contrast */
+    OLED_WriteCmd(0xCF);    /*   value 0xCF */
 
-    OLED_WriteCmd(0x81);    /* 设置对比度 */
-    OLED_WriteCmd(0xCF);    /*   对比度值 0xCF (0~255, 越大越亮) */
+    OLED_WriteCmd(0xA6);    /* normal display mode */
 
-    OLED_WriteCmd(0xA6);    /* 正常显示模式 (0xA7=反白显示) */
+    OLED_WriteCmd(0xA8);    /* multiplex ratio */
+    OLED_WriteCmd(0x3F);    /*   64 rows */
 
-    OLED_WriteCmd(0xA8);    /* 设置多路复用比 (驱动行数-1) */
-    OLED_WriteCmd(0x3F);    /*   64-1=63 → 64 行 (128×64 分辨率) */
+    OLED_WriteCmd(0xD3);    /* display vertical offset */
+    OLED_WriteCmd(0x00);    /*   none */
 
-    OLED_WriteCmd(0xD3);    /* 设置显示垂直偏移 */
-    OLED_WriteCmd(0x00);    /*   0 = 不偏移 */
+    OLED_WriteCmd(0xD5);    /* clock divide / oscillator */
+    OLED_WriteCmd(0x80);    /*   default */
 
-    OLED_WriteCmd(0xD5);    /* 设置显示时钟分频 / 振荡器频率 */
-    OLED_WriteCmd(0x80);    /*   默认值 */
+    OLED_WriteCmd(0xD9);    /* precharge period */
+    OLED_WriteCmd(0xF1);    /*   recommended */
 
-    OLED_WriteCmd(0xD9);    /* 设置预充电周期 */
-    OLED_WriteCmd(0xF1);    /*   推荐值 */
+    OLED_WriteCmd(0xDA);    /* COM pins hardware config */
+    OLED_WriteCmd(0x12);    /*   128x64 recommended */
 
-    OLED_WriteCmd(0xDA);    /* 设置 COM 引脚硬件配置 */
-    OLED_WriteCmd(0x12);    /*   128×64 模式的推荐配置 */
+    OLED_WriteCmd(0xDB);    /* VCOMH deselect level */
+    OLED_WriteCmd(0x40);    /*   ~0.77 x VCC */
 
-    OLED_WriteCmd(0xDB);    /* 设置 VCOMH 电压 */
-    OLED_WriteCmd(0x40);    /*   约 0.77 × VCC */
+    OLED_WriteCmd(0x8D);    /* charge pump */
+    OLED_WriteCmd(0x14);    /*   enable (required at 3.3 V) */
 
-    OLED_WriteCmd(0x8D);    /* ★ 开启电荷泵 (3.3V 供电的核心配置!) */
-    OLED_WriteCmd(0x14);    /*   0x14 = 启用电荷泵, 0x10 = 关闭 */
+    OLED_WriteCmd(0xA4);    /* resume to RAM content */
 
-    OLED_WriteCmd(0xA4);    /* 全屏显示模式 (跟随 GDDRAM 内容) */
-
-    OLED_WriteCmd(0xAF);    /* ★ 打开显示! (0xAE=关, 0xAF=开) */
+    OLED_WriteCmd(0xAF);    /* display on */
 }
 
-/* ============================================================
- *                  清 屏 / 全 屏 填 充
- * ============================================================
- */
-/**
- * @brief  清屏: 把 GDDRAM 所有字节写成 0x00 (所有像素熄灭)
- *
- *  遍历 8 页 × 128 列, 全部写 0.
- *  使用 OLED_WriteMultiData 批量发送, 效率较高.
- */
+/** @brief Clear the whole GDDRAM (all pixels off). */
 void OLED_Clear(void)
 {
     uint8_t page, col;
 
     for (page = 0; page < OLED_PAGES; page++)
     {
-        OLED_SetCursor(page, 0);            /* 光标移到当前页的起始列 */
+        OLED_SetCursor(page, 0);
 
-        /* 一次性写 128 个 0x00 → 该页全部像素熄灭 */
         I2C_Start();
         I2C_SendByte(OLED_ADDR_WRITE);
         I2C_WaitAck();
@@ -352,13 +246,10 @@ void OLED_Clear(void)
         I2C_Stop();
     }
 
-    /* 清屏后光标回到原点 */
     OLED_SetCursor(0, 0);
 }
 
-/**
- * @brief  全屏填充: 所有像素点亮 (用于测试屏幕是否有坏点)
- */
+/** @brief Fill the whole GDDRAM with 0xFF (all pixels on; test pattern). */
 void OLED_Fill(void)
 {
     uint8_t page, col;
@@ -374,7 +265,7 @@ void OLED_Fill(void)
         I2C_WaitAck();
         for (col = 0; col < OLED_WIDTH; col++)
         {
-            I2C_SendByte(0xFF);  /* 0xFF = 一列 8 像素全亮 */
+            I2C_SendByte(0xFF);
             I2C_WaitAck();
         }
         I2C_Stop();
@@ -383,118 +274,81 @@ void OLED_Fill(void)
     OLED_SetCursor(0, 0);
 }
 
-/* ============================================================
- *                 显 示 字 符 / 字 符 串
- * ============================================================
- */
 /**
- * @brief  在指定位置显示一个 ASCII 字符
- * @param  x:  列坐标 (0~127), 代表屏幕的水平位置
- * @param  y:  页坐标 (0~7),   代表屏幕的垂直位置 (每页 = 8 像素高)
- * @param  ch: 要显示的 ASCII 字符 (0x20 ~ 0x7E)
- *
- *  实现步骤:
- *    1. 如果字符超出可显示范围, 用空格替代
- *    2. 计算字符在字体表中的偏移: (ch - 0x20) * 6
- *    3. 设置光标到目标页和列
- *    4. 批量写入 6 个字节的字体数据
- *    5. 写完后光标自动停留在该字符之后, 连续写下一个字符无需重设位置
- *
- *  为什么是 6 个字节?
- *    每个字符宽 6 列像素. 第 6 列通常为全 0, 作为字符间距.
+ * @brief  Display one ASCII character.
+ * @param  x: column 0..127
+ * @param  y: page 0..7 (8 pixels high)
+ * @param  ch: character to display; chars outside 0x20..0x7E shown as space
  */
 void OLED_ShowChar(uint8_t x, uint8_t y, char ch)
 {
-    /* 超出可打印范围 (0x20=' ' 到 0x7E='~'), 用空格替代 */
     if (ch < ' ' || ch > '~')
         ch = ' ';
 
-    /* 设置写入位置 */
     OLED_SetCursor(y, x);
 
-    /*
-     * 从字体表中取出字符的 6 个字节并一次性发送.
-     *
-     * 指针运算解释:
-     *   Font6x8[ch - 0x20]  →  取到该字符对应的 6 字节数组
-     *   因为字体表的第一个元素是空格 (0x20), 所以 'A'-0x20 就是 'A' 在表中的序号
-     */
+    /* 6 bytes per glyph; font index = (ch - 0x20) */
     OLED_WriteMultiData(Font6x8[ch - 0x20], 6);
 }
 
 /**
- * @brief  在指定位置显示字符串
- * @param  x: 起始列坐标 (字符串从此位置开始向右显示)
- * @param  y: 页坐标
- * @param  str: 以 '\0' 结尾的字符串
- *
- *  支持自动换行: 如果字符超出右边距 (x > 127-6), 自动跳到下一行.
- *  注意: 只处理自动换行, 不处理超出 8 页的情况 (超出屏幕底部会被截断).
+ * @brief  Display a NUL-terminated string with automatic line wrap.
+ * @param  x: start column
+ * @param  y: start page
+ * @param  str: string to display
  */
 void OLED_ShowString(uint8_t x, uint8_t y, const char *str)
 {
-    uint8_t col = x;    /* 当前写入列 */
+    uint8_t col = x;
 
     while (*str != '\0')
     {
-        /* 如果当前列放不下一个字符 (6 像素宽), 换行 */
-        if (col > OLED_WIDTH - 6)
+        if (col > OLED_WIDTH - 6)   /* wrap: glyph is 6 columns wide */
         {
-            col = 0;    /* 回到行首 */
-            y++;        /* 下一页 */
+            col = 0;
+            y++;
         }
 
-        /* 超出屏幕高度, 停止显示 */
-        if (y >= OLED_PAGES)
+        if (y >= OLED_PAGES)        /* past bottom of screen */
             break;
 
         OLED_ShowChar(col, y, *str);
 
-        col += 6;       /* 每个字符占 6 列, 光标右移 */
-        str++;          /* 下一个字符 */
+        col += 6;
+        str++;
     }
 }
 
-/* ============================================================
- *                 显 示 数 字
- * ============================================================
- */
 /**
- * @brief  显示一个有符号整数
- * @param  x:    起始列位置
- * @param  y:    页位置
- * @param  num:  要显示的数字 (可为负数)
- * @param  len:  显示的总位数 (高位不够用空格补齐, 用于对齐)
- *
- *  例: OLED_ShowNum(0, 0, -42, 5) → 显示 "  -42"
- *      OLED_ShowNum(0, 0, 123, 4)  → 显示 " 123"
+ * @brief  Display a signed integer, right-aligned to len digits
+ *         (leading spaces; minus sign included in the width).
+ * @param  x:   start column
+ * @param  y:   page
+ * @param  num: value to display
+ * @param  len: total digit width
  */
 void OLED_ShowNum(uint8_t x, uint8_t y, int32_t num, uint8_t len)
 {
-    char buf[12];   /* 最多显示 11 位 (含符号) + 1 个 '\0' */
+    char buf[12];   /* up to 11 digits + sign, plus NUL */
     uint8_t i;
 
-    /* 处理负数 */
     if (num < 0)
     {
-        buf[len] = '\0';        /* 先放字符串结尾 */
-        num = -num;             /* 取绝对值 */
+        buf[len] = '\0';
+        num = -num;
 
-        /* 从右往左逐位填入数字 */
         for (i = len - 1; ; i--)
         {
-            buf[i] = '0' + (num % 10);  /* 取个位数转为字符 */
-            num /= 10;                   /* 去掉已处理的位 */
+            buf[i] = '0' + (num % 10);
+            num /= 10;
 
             if (num == 0)
                 break;
-            if (i == 0) break;           /* 防止溢出 */
+            if (i == 0) break;
         }
 
-        /* 前导空格 */
         while (i > 1) { buf[--i] = ' '; }
 
-        /* 负号 */
         buf[0] = '-';
     }
     else
@@ -508,7 +362,6 @@ void OLED_ShowNum(uint8_t x, uint8_t y, int32_t num, uint8_t len)
                 break;
             if (i == 0) break;
         }
-        /* 前导空格 */
         while (i > 0) { buf[--i] = ' '; }
     }
 
@@ -516,52 +369,40 @@ void OLED_ShowNum(uint8_t x, uint8_t y, int32_t num, uint8_t len)
 }
 
 /**
- * @brief  显示一个浮点数 (保留指定小数位数)
- * @param  x:      起始列位置
- * @param  y:      页位置
- * @param  num:    要显示的浮点数
- * @param  intLen: 整数部分显示位数
- * @param  decLen: 小数部分显示位数
- *
- *  例: OLED_ShowFloat(0, 0, 3.14, 2, 2) → 显示 " 3.14"
- *
- *  处理负数的方法:
- *    如果 num < 0, 先输出负号, 然后对绝对值进行转换.
+ * @brief  Display a float with fixed integer and decimal widths.
+ * @param  x:      start column
+ * @param  y:      page
+ * @param  num:    value to display
+ * @param  intLen: integer digit width
+ * @param  decLen: decimal digit count
  */
 void OLED_ShowFloat(uint8_t x, uint8_t y, float num, uint8_t intLen, uint8_t decLen)
 {
     uint32_t intPart, decPart;
     uint8_t negative = 0;
 
-    /* 处理负数 */
     if (num < 0)
     {
         negative = 1;
         num = -num;
     }
 
-    /* 分离整数和小数部分 */
-    intPart = (uint32_t)num;                              /* 整数部分 */
-    float frac = num - (float)intPart;                    /* 小数部分 (0.xxx) */
+    intPart = (uint32_t)num;
+    float frac = num - (float)intPart;
 
-    /* 将小数部分转为整数 (例: frac=0.14, decLen=2 → 0.14*100=14) */
+    /* scale fraction: 0.14, decLen=2 -> 14 */
     {
         uint8_t i;
         for (i = 0; i < decLen; i++)
             frac *= 10;
     }
-    decPart = (uint32_t)(frac + 0.5f);                    /* +0.5 用于四舍五入 */
+    decPart = (uint32_t)(frac + 0.5f);                    /* round */
 
-    /*
-     * 手动构建字符串, 格式: [负号][空格...整数][小数点][小数]
-     * 这里用 OLED_ShowChar 逐字输出更灵活
-     */
+    /* build string: [sign][pad..int][.][dec] */
     uint8_t buf[12];
     uint8_t pos = 0;
 
-    /* 先在同一行拼好字符串, 再一次性用 ShowString 显示 */
-
-    /* --- 整数部分 (右对齐, 前导空格) --- */
+    /* --- integer part (right-aligned, leading spaces) --- */
     {
         uint8_t intBuf[6];
         uint8_t intCount = 0;
@@ -579,14 +420,11 @@ void OLED_ShowFloat(uint8_t x, uint8_t y, float num, uint8_t intLen, uint8_t dec
             }
         }
 
-        /* 前导空格 */
         while (intCount < intLen)
             buf[pos++] = ' ';
 
-        /* 如果有负号且还有空间 */
         if (negative && pos > 0)
         {
-            /* 负号放在数字前面紧挨着 */
             buf[pos - 1] = '-';
         }
         else if (negative)
@@ -594,7 +432,7 @@ void OLED_ShowFloat(uint8_t x, uint8_t y, float num, uint8_t intLen, uint8_t dec
             buf[pos++] = '-';
         }
 
-        /* 倒序填入整数数字 (因为 intBuf 存的是低位在前) */
+        /* digits were stored LSB first: write back-to-front */
         {
             int8_t j;
             for (j = intCount - 1; j >= 0; j--)
@@ -602,10 +440,9 @@ void OLED_ShowFloat(uint8_t x, uint8_t y, float num, uint8_t intLen, uint8_t dec
         }
     }
 
-    /* --- 小数点 --- */
     buf[pos++] = '.';
 
-    /* --- 小数部分 --- */
+    /* --- fractional part (zero-padded) --- */
     {
         uint8_t decBuf[6];
         uint8_t decCount = 0;
@@ -623,11 +460,10 @@ void OLED_ShowFloat(uint8_t x, uint8_t y, float num, uint8_t intLen, uint8_t dec
             }
         }
 
-        /* 小数部分右对齐 (高位补零, 区别于整数的前导空格) */
         while (decCount < decLen)
             decBuf[decCount++] = 0;
 
-        /* 倒序填入 */
+        /* write back-to-front */
         {
             int8_t j;
             for (j = decCount - 1; j >= 0; j--)
@@ -637,6 +473,5 @@ void OLED_ShowFloat(uint8_t x, uint8_t y, float num, uint8_t intLen, uint8_t dec
 
     buf[pos] = '\0';
 
-    /* 一次性显示整个字符串 */
     OLED_ShowString(x, y, (const char *)buf);
 }

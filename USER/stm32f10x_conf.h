@@ -1,21 +1,14 @@
 /**
-  ******************************************************************************
-  * @file    stm32f10x_conf.h
-  * @brief   STM32 标准外设库 — 全局配置文件
-  *
-  *  作用:
-  *    1. 决定项目中包含哪些外设库的头文件
-  *    2. 配置 assert_param 宏 (调试断言)
-  *
-  *  本实验实际只需要 gpio, rcc, misc 三个外设,
-  *  但保留全部 include 以避免编译其他库文件时缺少头文件.
-  ******************************************************************************
-  */
+ * @file    stm32f10x_conf.h
+ * @brief   STM32F10x standard peripheral library configuration.
+ *          Includes all peripheral headers so library files always
+ *          compile; asserts are optional via USE_FULL_ASSERT.
+ */
 
 #ifndef __STM32F10x_CONF_H
 #define __STM32F10x_CONF_H
 
-/* ========== 外设头文件 ========== */
+/* Peripheral library headers */
 #include "stm32f10x_adc.h"
 #include "stm32f10x_bkp.h"
 #include "stm32f10x_can.h"
@@ -40,8 +33,8 @@
 #include "stm32f10x_wwdg.h"
 #include "misc.h"
 
-/* ========== 断言配置 ========== */
-/* #define USE_FULL_ASSERT    1 */  /* 取消注释以启用参数断言检查 (调试用) */
+/* Assert configuration */
+/* #define USE_FULL_ASSERT    1 */  /* Uncomment to enable parameter asserts */
 
 #ifdef  USE_FULL_ASSERT
   #define assert_param(expr) ((expr) ? (void)0 : assert_failed((uint8_t *)__FILE__, __LINE__))

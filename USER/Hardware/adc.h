@@ -3,22 +3,20 @@
 
 #include "stm32f10x.h"
 
-/*
- * adc_value - 全局 ADC 转换结果
- *
- * 由 ADC1_2_IRQHandler 在中断中更新，
- * 主循环读取这个变量获取最新转换值。
+/**
+ * @file    adc.h
+ * @brief   ADC1 single-channel driver (PA1 / CH1) with EOC interrupt.
  */
+
+/** Latest conversion result, updated in ADC1_2_IRQHandler. */
 extern volatile uint16_t adc_value;
 
-/*
- * adc_conversion_done - 通知主循环 "数据已就绪"
- *
- * ISR 中置 1，主循环检测到后清零。
- */
-extern volatile uint8_t adc_conversion_done;
+/** Conversion-ready flag: set by ISR, cleared by main loop. */
+extern volatile uint8_t  adc_conversion_done;
 
+/** @brief Configure PA1 as analog input (and ADC clock <= 14 MHz). */
 void ADC_GPIO_Config(void);
+/** @brief Configure ADC1 mode, EOC interrupt, calibration and NVIC. */
 void ADC1_Mode_Config(void);
 
 #endif /* __ADC_H */
