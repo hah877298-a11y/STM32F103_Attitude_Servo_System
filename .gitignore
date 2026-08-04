@@ -1,0 +1,37 @@
+# Keil MDK build outputs
+MDK-ARM/Objects/
+MDK-ARM/Listings/
+MDK-ARM/DebugConfig/
+MDK-ARM/RTE/
+MDK-ARM/*.scvd
+MDK-ARM/*.uvguix.*
+MDK-ARM/objects/
+*.hex
+*.bin
+*.axf
+*.elf
+
+# Build artifacts
+*.o
+*.d
+*.crf
+*.dep
+*.lst
+*.lnp
+*.plg
+*.tra
+
+# Backup files
+*.bak
+*.orig
+
+# JLink / ST-Link logs
+*.jlink
+JLinkLog.txt
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
