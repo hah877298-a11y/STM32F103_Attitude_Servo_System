@@ -10,7 +10,6 @@
  *          Requires software I2C (i2c.h).
  */
 
-/* ========== MPU6050 I2C 从 机 地 址 ========== */
 /**
  * @name  I2C addresses
  * @note  AD0 = GND -> 7-bit address 0x68 (AD0 = VCC -> 0x69).
@@ -20,7 +19,7 @@
 #define MPU6050_ADDR_WRITE      (MPU6050_ADDR << 1)       /* 0xD0 */
 #define MPU6050_ADDR_READ       (MPU6050_ADDR << 1 | 1)   /* 0xD1 */
 
-/* ========== MPU6050 内 部 寄 存 器 地 址 ========== */
+/* ---- register map ---- */
 /* Registers used by this driver only; full list in the datasheet. */
 
 #define MPU6050_REG_SMPLRT_DIV   0x19   /* sample rate divider */
@@ -34,13 +33,13 @@
 #define MPU6050_REG_PWR_MGMT_1   0x6B   /* sleep/wake, clock source */
 #define MPU6050_REG_WHO_AM_I     0x75   /* device ID (0x68) */
 
-/* ========== 加 速 度 和 陀 螺 仪 的 量 程 换 算 因 子 ========== */
+/* ---- full-scale conversion factors ---- */
 /* Raw values are signed 16-bit; divide by the factor of the configured
  * full-scale range to obtain physical units. */
 #define MPU6050_GYRO_SCALE       16.4f    /* +/-2000 deg/s: 32768/2000 LSB/(deg/s) */
 #define MPU6050_ACCEL_SCALE      2048.0f  /* +/-16 g: 32768/16 LSB/g */
 
-/* ========== 数 据 结 构 ========== */
+/* ---- data structures ---- */
 /** @brief Raw sensor data (signed 16-bit, read from registers). */
 typedef struct
 {
@@ -65,7 +64,7 @@ typedef struct
     float Temp_C;       /* temperature (degC) */
 } MPU6050_PhyData;
 
-/* ========== 对 外 接 口 函 数 ========== */
+/* ---- public API ---- */
 
 /** @brief Initialize: wake-up, sample rate, DLPF, full-scale ranges. */
 void MPU6050_Init(void);

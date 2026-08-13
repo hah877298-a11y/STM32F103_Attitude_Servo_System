@@ -1,13 +1,24 @@
 #include "OLED.h"
 #include "i2c.h"
+#include "SysTick.h"
+#include <string.h>
 
 /**
  * @file    OLED.c
- * @brief   SSD1306 OLED display driver (128x64, I2C).
+ * @brief   SSD1306 OLED display driver (128x64, I2C) with framebuffer.
  * @note    GDDRAM: 8 pages x 128 columns; one byte = one 8-pixel column
  *          (bit0 = top). First byte of each transfer is the control byte:
  *          0x00 = command, 0x40 = data. Device address 0x3C (write 0x78).
+ *
+ *          Framebuffer: ShowChar/Clear/Fill edit a 1 KB RAM image only.
+ *          OLED_FlushPage() streams one page (128 bytes) to the panel.
+ *          Splitting the flush across pages keeps each I2C blocking
+ *          window short (~10-50 ms) instead of one long full-screen
+ *          flush that would starve the cooperative scheduler.
  */
+
+/** 1 KB framebuffer; ShowChar/Clear/Fill edit this RAM image only. */
+static uint8_t oled_fb[OLED_PAGES][OLED_WIDTH];
 
 /** 6x8 ASCII font (0x20..0x7E), 6 bytes per character.
  *  One byte = one column, LSB = top pixel; index = (ch - 0x20) * 6. */
@@ -176,11 +187,9 @@ void OLED_SetCursor(uint8_t page, uint8_t col)
  */
 void OLED_Init(void)
 {
-    /* ~300 ms power-on delay: VDD must be stable before I2C commands */
-    {
-        volatile uint32_t i;
-        for (i = 0; i < 800000; i++) __NOP();
-    }
+    /* ~300 ms power-on delay: VDD must be stable before I2C commands.
+     * Uses SysTick counter (not NOPs) for accurate, clock-agnostic timing. */
+    SysTick_DelayMs(300);
 
     OLED_WriteCmd(0xAE);    /* display off during configuration */
 
@@ -194,7 +203,7 @@ void OLED_Init(void)
     OLED_WriteCmd(0x40);    /* display start line 0 */
 
     OLED_WriteCmd(0x81);    /* contrast */
-    OLED_WriteCmd(0xCF);    /*   value 0xCF */
+    OLED_WriteCmd(0xCF);
 
     OLED_WriteCmd(0xA6);    /* normal display mode */
 
@@ -224,71 +233,70 @@ void OLED_Init(void)
     OLED_WriteCmd(0xAF);    /* display on */
 }
 
-/** @brief Clear the whole GDDRAM (all pixels off). */
+/** @brief Clear the framebuffer (all pixels off). RAM-only, no I2C. */
 void OLED_Clear(void)
 {
-    uint8_t page, col;
-
-    for (page = 0; page < OLED_PAGES; page++)
-    {
-        OLED_SetCursor(page, 0);
-
-        I2C_Start();
-        I2C_SendByte(OLED_ADDR_WRITE);
-        I2C_WaitAck();
-        I2C_SendByte(OLED_CTRL_DATA);
-        I2C_WaitAck();
-        for (col = 0; col < OLED_WIDTH; col++)
-        {
-            I2C_SendByte(0x00);
-            I2C_WaitAck();
-        }
-        I2C_Stop();
-    }
-
-    OLED_SetCursor(0, 0);
+    memset(oled_fb, 0x00, sizeof(oled_fb));
 }
 
-/** @brief Fill the whole GDDRAM with 0xFF (all pixels on; test pattern). */
+/** @brief Fill the framebuffer (all pixels on; test pattern). RAM-only. */
 void OLED_Fill(void)
 {
-    uint8_t page, col;
-
-    for (page = 0; page < OLED_PAGES; page++)
-    {
-        OLED_SetCursor(page, 0);
-
-        I2C_Start();
-        I2C_SendByte(OLED_ADDR_WRITE);
-        I2C_WaitAck();
-        I2C_SendByte(OLED_CTRL_DATA);
-        I2C_WaitAck();
-        for (col = 0; col < OLED_WIDTH; col++)
-        {
-            I2C_SendByte(0xFF);
-            I2C_WaitAck();
-        }
-        I2C_Stop();
-    }
-
-    OLED_SetCursor(0, 0);
+    memset(oled_fb, 0xFF, sizeof(oled_fb));
 }
 
 /**
- * @brief  Display one ASCII character.
+ * @brief  Stream one framebuffer page (128 bytes) to the panel.
+ * @param  page: page 0..7
+ * @note   One I2C transaction: cursor command + 128 data bytes.
+ *         Blocks ~10-50 ms depending on the bus speed; call one page
+ *         per scheduler slot to keep the main loop responsive.
+ */
+void OLED_FlushPage(uint8_t page)
+{
+    if (page >= OLED_PAGES)
+        return;
+
+    OLED_SetCursor(page, 0);
+    OLED_WriteMultiData(oled_fb[page], OLED_WIDTH);
+}
+
+/**
+ * @brief  Push every page to the panel (blocking; init only).
+ */
+void OLED_FlushAll(void)
+{
+    uint8_t page;
+
+    for (page = 0; page < OLED_PAGES; page++)
+    {
+        OLED_FlushPage(page);
+    }
+}
+
+/**
+ * @brief  Stamp one character into the framebuffer.
  * @param  x: column 0..127
  * @param  y: page 0..7 (8 pixels high)
  * @param  ch: character to display; chars outside 0x20..0x7E shown as space
+ * @note   RAM-only: the panel is updated later by OLED_FlushPage().
  */
 void OLED_ShowChar(uint8_t x, uint8_t y, char ch)
 {
+    uint8_t i;
+
     if (ch < ' ' || ch > '~')
         ch = ' ';
 
-    OLED_SetCursor(y, x);
+    if (y >= OLED_PAGES)
+        return;
 
-    /* 6 bytes per glyph; font index = (ch - 0x20) */
-    OLED_WriteMultiData(Font6x8[ch - 0x20], 6);
+    /* 6 bytes per glyph; font row = (ch - 0x20); clipped at right edge. */
+    for (i = 0; i < 6; i++)
+    {
+        if (x + i < OLED_WIDTH)
+            oled_fb[y][x + i] = Font6x8[ch - 0x20][i];
+    }
 }
 
 /**
@@ -329,7 +337,7 @@ void OLED_ShowString(uint8_t x, uint8_t y, const char *str)
  */
 void OLED_ShowNum(uint8_t x, uint8_t y, int32_t num, uint8_t len)
 {
-    char buf[12];   /* up to 11 digits + sign, plus NUL */
+    char buf[12];   /* len + 1 for NUL terminator */
     uint8_t i;
 
     if (num < 0)

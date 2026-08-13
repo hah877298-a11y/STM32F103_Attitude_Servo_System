@@ -12,15 +12,15 @@
  *          the USB port may brown out and reset the MCU.
  */
 
-/* ========== 舵 机 角 度 范 围 ========== */
+/* ---- angle range ---- */
 #define SERVO_MIN_ANGLE     0       /* min angle (deg) */
 #define SERVO_MAX_ANGLE     180     /* max angle (deg) */
 
-/* ========== PWM 脉 冲 范 围 (CCR 值, 1MHz 时钟) ========== */
+/* ---- pulse range (us) ---- */
 #define SERVO_MIN_PULSE     500     /* 0.5 ms -> 0 deg */
 #define SERVO_MAX_PULSE     2500    /* 2.5 ms -> 180 deg */
 
-/* ========== 对 外 接 口 ========== */
+/* ---- public API ---- */
 
 /** @brief Initialize TIM2_CH1 PWM output (servo parks at 90 deg). */
 void Servo_Init(void);

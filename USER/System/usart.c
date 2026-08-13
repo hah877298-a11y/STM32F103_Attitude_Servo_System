@@ -1,10 +1,11 @@
 /**
  * @file    usart.c
- * @brief   USART1 + DMA driver with VOFA+ JustFloat protocol support.
+ * @brief   USART1 + DMA driver with VOFA+ FireWater (CSV) support.
  *          PA9=TX / PA10=RX, 115200-8-N-1; TX via DMA1_Channel4.
  */
 #include "usart.h"
 #include <stddef.h>
+#include <stdio.h>
 
 /* Busy flag: drop new frames while the previous DMA transfer runs */
 static volatile uint8_t dmaTxBusy = 0;
@@ -48,12 +49,12 @@ void UART1_DMA_Init(void)
 
     DMA_DeInit(DMA1_Channel4);
 
-    dma.DMA_PeripheralBaseAddr = (uint32_t)&USART1->DR;  /* Peripheral = USART1 DR */
-    dma.DMA_MemoryBaseAddr     = 0;                      /* Set per transfer in UART1_DMA_Send() */
-    dma.DMA_DIR                = DMA_DIR_PeripheralDST;  /* Memory -> peripheral */
+    dma.DMA_PeripheralBaseAddr = (uint32_t)&USART1->DR;
+    dma.DMA_MemoryBaseAddr     = 0;                      /* set per transfer in UART1_DMA_Send() */
+    dma.DMA_DIR                = DMA_DIR_PeripheralDST;
     dma.DMA_BufferSize         = 0;
-    dma.DMA_PeripheralInc      = DMA_PeripheralInc_Disable;  /* Peripheral addr fixed */
-    dma.DMA_MemoryInc          = DMA_MemoryInc_Enable;       /* Memory addr increments */
+    dma.DMA_PeripheralInc      = DMA_PeripheralInc_Disable;
+    dma.DMA_MemoryInc          = DMA_MemoryInc_Enable;
     dma.DMA_PeripheralDataSize = DMA_PeripheralDataSize_Byte;
     dma.DMA_MemoryDataSize     = DMA_MemoryDataSize_Byte;
     dma.DMA_Mode               = DMA_Mode_Normal;
@@ -105,38 +106,41 @@ void UART1_DMA_Update(void)
 }
 
 /**
- * @brief  Send one frame of float channels in VOFA+ JustFloat format.
- * @param  data:     Array of channel values (IEEE754, little-endian)
- * @param  channels: Number of channels (1..VOFA_MAX_CHANNELS)
- * @note   Frame ends with a float +Inf tail (VOFA_TAIL) that VOFA+
- *         uses as the frame delimiter.
+ * @brief  Send one frame of float channels in VOFA+ FireWater CSV format.
+ * @param  data:     channel values
+ * @param  channels: channel count (1..VOFA_MAX_CHANNELS)
+ * @note   ASCII CSV line, e.g. "1.23,4.56,90.00\r\n".
+ *         Static buffer keeps the pointer valid while DMA is reading
+ *         it (avoids use-after-stack-return).
  */
 void VOFA_SendFrame(const float *data, uint8_t channels)
 {
-    uint8_t buf[VOFA_MAX_CHANNELS * 4 + 4];  /* channels*4 bytes + 4-byte tail */
-    uint8_t i, pos = 0;
-    uint32_t tail = VOFA_TAIL;               /* IEEE754 +Inf bit pattern */
+    static char buf[128];  /* static: stays valid during DMA transfer */
+    uint8_t i;
+    int pos = 0;
 
     if (channels == 0 || channels > VOFA_MAX_CHANNELS)
         return;
 
     for (i = 0; i < channels; i++)
     {
-        uint32_t raw = *(const uint32_t *)(&data[i]);  /* float bit pattern */
+        /* "%.2f" per channel into the remaining space (leave room for \r\n\0) */
+        int remain = (int)sizeof(buf) - pos;
+        if (remain < 10) break;  /* guard against overflow */
 
-        buf[pos++] = (uint8_t)(raw);        /* LSB first (little-endian) */
-        buf[pos++] = (uint8_t)(raw >> 8);
-        buf[pos++] = (uint8_t)(raw >> 16);
-        buf[pos++] = (uint8_t)(raw >> 24);
+        pos += snprintf(buf + pos, remain, "%.2f", (double)data[i]);
+
+        if (i < channels - 1 && pos < (int)sizeof(buf) - 2)
+            buf[pos++] = ',';
     }
 
-    /* Frame tail: +Inf = 0x7F800000, little-endian */
-    buf[pos++] = (uint8_t)(tail);
-    buf[pos++] = (uint8_t)(tail >> 8);
-    buf[pos++] = (uint8_t)(tail >> 16);
-    buf[pos++] = (uint8_t)(tail >> 24);
+    if (pos < (int)sizeof(buf) - 2)
+    {
+        buf[pos++] = '\r';
+        buf[pos++] = '\n';
+    }
 
-    UART1_DMA_Send(buf, pos);
+    UART1_DMA_Send((const uint8_t *)buf, (uint16_t)pos);
 }
 
 /**
@@ -146,7 +150,7 @@ void VOFA_SendFrame(const float *data, uint8_t channels)
  */
 void UART_SendByte(uint8_t byte)
 {
-    while (!(USART1->SR & USART_SR_TXE));   /* Wait for TX register empty */
+    while (!(USART1->SR & USART_SR_TXE));   /* wait for TXE */
     USART1->DR = byte;
 }
 

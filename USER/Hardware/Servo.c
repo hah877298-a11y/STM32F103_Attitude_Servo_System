@@ -49,7 +49,7 @@ void Servo_Init(void)
     TIM_OC1PreloadConfig(TIM2, TIM_OCPreload_Enable);
 
     TIM_ARRPreloadConfig(TIM2, ENABLE);
-    TIM_Cmd(TIM2, ENABLE);               /* start PWM output */
+    TIM_Cmd(TIM2, ENABLE);
 }
 
 /**

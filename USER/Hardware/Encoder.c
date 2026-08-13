@@ -58,7 +58,7 @@ void Encoder_Init(void)
 /**
  * @brief  Encoder ISR handler; call from EXTI15_10_IRQHandler.
  * @note   Direction from B level on A's falling edge: B = 0 -> CW,
- *         B = 1 -> CCW. Debounce by ISR timestamp. Keep it short.
+ *         B = 1 -> CCW. Debounce via ISR timestamp.
  */
 void Encoder_OnInterrupt(void)
 {
@@ -83,10 +83,7 @@ void Encoder_OnInterrupt(void)
     }
 }
 
-/* ============================================================
- *              获 取 / 清 零 编 码 器 计 数
- * ============================================================
- */
+/* ---- count access ---- */
 /**
  * @brief  Get the accumulated pulse count (CW positive, CCW negative).
  * @return current pulse count
@@ -106,32 +103,80 @@ void Encoder_ResetCount(void)
     encoder_count = 0;
 }
 
+/* ---- SW non-blocking debounce state machine ---- */
+/* Polled every 200 ms from the main loop.
+ *   IDLE         -> pin low          -> DEBOUNCE (record timestamp)
+ *   DEBOUNCE     -> 20 ms elapsed, still low -> WAIT_RELEASE
+ *                 -> 20 ms elapsed, high     -> IDLE (glitch)
+ *   WAIT_RELEASE -> pin high         -> IDLE, return 1 (valid press)
+ *                 -> 500 ms timeout  -> IDLE (long press, ignored)
+ * All timing via SysTick timestamps; never blocks. */
+
+#define SW_DEBOUNCE_MS     20      /* debounce interval (ms) */
+#define SW_HOLD_TIMEOUT_MS  500     /* long-press timeout (ms) */
+
+typedef enum {
+    SW_IDLE = 0,
+    SW_DEBOUNCE,
+    SW_WAIT_RELEASE
+} EncoderSW_State;
+
+static EncoderSW_State sw_state = SW_IDLE;
+static uint32_t sw_timestamp = 0;
+
 /**
- * @brief  Debounced SW button read (pull-up: pressed = low).
- * @return 1 on a valid press (double-checked with delay), else 0
- * @note   Blocking debounce ~20 ms is acceptable in the 200 ms task;
- *         the release wait is timeout-guarded so a long press cannot
- *         stall the IWDG feed.
+ * @brief  Non-blocking debounced SW button read (pull-up: pressed = low).
+ * @return 1 on a valid short press (press + release), else 0
+ * @note   Poll at >= 50 Hz. State machine advances on each call;
+ *         never blocks the caller.
  */
 uint8_t Encoder_SW_Pressed(void)
 {
-    if (GPIO_ReadInputDataBit(ENCODER_PORT, ENCODER_SW_PIN) == Bit_RESET)
+    uint32_t now = SysTick_Get();
+    uint8_t  pin = GPIO_ReadInputDataBit(ENCODER_PORT, ENCODER_SW_PIN);
+
+    switch (sw_state)
     {
-        /* ~20 ms debounce */
+    case SW_IDLE:
+        if (pin == Bit_RESET)           /* pressed */
         {
-            volatile uint32_t i;
-            for (i = 0; i < 200000; i++) __NOP();
+            sw_state     = SW_DEBOUNCE;
+            sw_timestamp = now;
+        }
+        break;
+
+    case SW_DEBOUNCE:
+        if (now - sw_timestamp < SW_DEBOUNCE_MS)
+        {
+            /* still inside debounce window; wait */
+            break;
         }
 
-        /* still low: confirmed press */
-        if (GPIO_ReadInputDataBit(ENCODER_PORT, ENCODER_SW_PIN) == Bit_RESET)
+        if (pin == Bit_RESET)           /* confirmed press */
         {
-            /* wait for release, max ~500 ms */
-            volatile uint32_t timeout = 5000000;
-            while (GPIO_ReadInputDataBit(ENCODER_PORT, ENCODER_SW_PIN) == Bit_RESET
-                   && --timeout);
+            sw_state     = SW_WAIT_RELEASE;
+            sw_timestamp = now;
+        }
+        else                            /* glitch: discard */
+        {
+            sw_state = SW_IDLE;
+        }
+        break;
+
+    case SW_WAIT_RELEASE:
+        if (pin != Bit_RESET)           /* released -> valid short press */
+        {
+            sw_state = SW_IDLE;
             return 1;
         }
+
+        /* long-press guard: ignore holds > 500 ms */
+        if (now - sw_timestamp > SW_HOLD_TIMEOUT_MS)
+        {
+            sw_state = SW_IDLE;
+        }
+        break;
     }
+
     return 0;
 }

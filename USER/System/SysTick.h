@@ -10,8 +10,9 @@
  *          core timer; no TIM peripheral is occupied.
  */
 
-void SysTick_Init(void);         /* Init SysTick, 1ms interrupt */
-uint32_t SysTick_Get(void);      /* Get elapsed milliseconds */
-void SysTick_IncTick(void);      /* Increment tick counter (ISR internal) */
+void SysTick_Init(void);         /* 1 ms interrupt */
+uint32_t SysTick_Get(void);      /* elapsed ms since init */
+void SysTick_IncTick(void);      /* ISR only */
+void SysTick_DelayMs(uint32_t ms); /* blocking; init only, not for main loop */
 
 #endif /* __SYSTICK_H */

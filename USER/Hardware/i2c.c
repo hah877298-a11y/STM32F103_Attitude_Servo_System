@@ -11,7 +11,8 @@
 /** @brief I2C half-period delay (~5 us @ 72 MHz, ~100 kHz SCL). */
 static void I2C_Delay(void)
 {
-    /* If the bus is unstable, raise to 200 iterations (~25 kHz). */
+    /* ~5 us half-period @ 72 MHz -> ~100 kHz SCL.
+     * Clock stretching is handled separately, so the delay stays short. */
     for (volatile uint16_t i = 0; i < 50; i++)
     {
         __NOP();
@@ -67,6 +68,20 @@ void I2C_Stop(void)
 }
 
 /**
+ * @brief  Wait for SCL to actually go high (clock stretching).
+ * @note   Slaves may hold SCL low after ACK or during internal ops.
+ *         Without this check, the master can start the next bit while
+ *         the slave is still processing the previous one -> bit errors.
+ *         Timeout-guarded to prevent bus-stuck deadlocks.
+ */
+static uint8_t I2C_WaitSCL_High(void)
+{
+    volatile uint32_t timeout = 100000;
+    while (I2C_SCL_READ() == Bit_RESET && --timeout);
+    return (timeout == 0) ? 1 : 0;  /* 0 = OK, 1 = timeout */
+}
+
+/**
  * @brief  Transmit one byte, MSB first.
  * @param  data: byte to send
  */
@@ -76,7 +91,7 @@ void I2C_SendByte(uint8_t data)
 
     for (i = 0; i < 8; i++)
     {
-        if (data & 0x80)        /* bit7 = 1 */
+        if (data & 0x80)
             I2C_SDA_H();
         else
             I2C_SDA_L();
@@ -84,7 +99,8 @@ void I2C_SendByte(uint8_t data)
         data <<= 1;
 
         I2C_Delay();
-        I2C_SCL_H();            /* slave samples on SCL rising edge */
+        I2C_SCL_H();            /* release SCL; slave may stretch */
+        I2C_WaitSCL_High();
         I2C_Delay();
         I2C_SCL_L();
         I2C_Delay();
@@ -104,6 +120,7 @@ uint8_t I2C_WaitAck(void)
     I2C_Delay();
 
     I2C_SCL_H();
+    I2C_WaitSCL_High();
     I2C_Delay();
 
     ack = I2C_SDA_READ();
@@ -134,6 +151,7 @@ uint8_t I2C_ReadByte(uint8_t ack)
         data <<= 1;
 
         I2C_SCL_H();
+        I2C_WaitSCL_High();
         I2C_Delay();
 
         if (I2C_SDA_READ())     /* sample data while SCL high */
@@ -151,6 +169,7 @@ uint8_t I2C_ReadByte(uint8_t ack)
 
     I2C_Delay();
     I2C_SCL_H();
+    I2C_WaitSCL_High();
     I2C_Delay();
     I2C_SCL_L();
     I2C_Delay();

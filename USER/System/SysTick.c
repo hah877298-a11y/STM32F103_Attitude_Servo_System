@@ -41,3 +41,18 @@ void SysTick_IncTick(void)
 {
     sysTickCounter++;
 }
+
+/**
+ * @brief  Blocking delay in milliseconds, based on the 1 ms tick counter.
+ * @param  ms: delay length, must be > 0
+ * @note   Init sequences only; never call from the main task loop
+ *         (would break the non-blocking architecture).
+ */
+void SysTick_DelayMs(uint32_t ms)
+{
+    uint32_t target = sysTickCounter + ms;
+    while (sysTickCounter < target)
+    {
+        /* spin; ISR advances sysTickCounter every 1 ms */
+    }
+}

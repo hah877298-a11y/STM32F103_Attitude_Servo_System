@@ -340,7 +340,7 @@
               <MiscControls></MiscControls>
               <Define>USE_STDPERIPH_DRIVER</Define>
               <Undefine></Undefine>
-              <IncludePath>..\libraies\STM32F10x_StdPeriph_Driver\inc;..\libraies\CMSIS\CM3\CoreSupport;..\USER;..\USER\Hardware;..\USER\Algorithm;..\USER\System;..\libraies\CMSIS\CM3\DeviceSupport\ST\STM32F10x</IncludePath>
+              <IncludePath>..\libraies\STM32F10x_StdPeriph_Driver\inc;..\libraies\CMSIS\CM3\CoreSupport;..\USER;..\USER\Hardware;..\USER\Algorithm;..\USER\System;..\USER\App;..\libraies\CMSIS\CM3\DeviceSupport\ST\STM32F10x</IncludePath>
             </VariousControls>
           </Cads>
           <Aads>
@@ -393,6 +393,11 @@
               <FileName>stm32f10x_it.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\USER\stm32f10x_it.c</FilePath>
+            </File>
+            <File>
+              <FileName>system_config.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\USER\system_config.h</FilePath>
             </File>
           </Files>
         </Group>
@@ -599,16 +604,6 @@
               <FileType>1</FileType>
               <FilePath>..\USER\Hardware\Servo.c</FilePath>
             </File>
-            <File>
-              <FileName>spi.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\USER\Hardware\spi.c</FilePath>
-            </File>
-            <File>
-              <FileName>w25q64.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\USER\Hardware\w25q64.c</FilePath>
-            </File>
           </Files>
         </Group>
         <Group>
@@ -623,6 +618,16 @@
               <FileName>usart.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\USER\System\usart.c</FilePath>
+            </File>
+          </Files>
+        </Group>
+        <Group>
+          <GroupName>App</GroupName>
+          <Files>
+            <File>
+              <FileName>task_scheduler.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\USER\App\task_scheduler.c</FilePath>
             </File>
           </Files>
         </Group>

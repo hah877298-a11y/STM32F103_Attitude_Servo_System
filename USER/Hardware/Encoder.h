@@ -12,14 +12,14 @@
  *          Used to adjust the PID setpoint (+/-5 deg per step).
  */
 
-/* ========== 编 码 器 GPIO 宏 定 义 ========== */
+/* ---- GPIO macros ---- */
 #define ENCODER_PORT        GPIOB
 #define ENCODER_A_PIN       GPIO_Pin_12   /* A phase -> PB12 */
 #define ENCODER_B_PIN       GPIO_Pin_13   /* B phase -> PB13 */
 #define ENCODER_SW_PIN      GPIO_Pin_14   /* SW button -> PB14 */
 #define ENCODER_RCC_CLOCK   RCC_APB2Periph_GPIOB
 
-/* ========== 对 外 接 口 ========== */
+/* ---- public API ---- */
 
 /** @brief Initialize encoder GPIO + EXTI interrupts. */
 void Encoder_Init(void);

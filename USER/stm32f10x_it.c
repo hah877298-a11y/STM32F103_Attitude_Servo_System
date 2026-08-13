@@ -9,8 +9,7 @@
 #include "Encoder.h"
 #include "adc.h"
 
-/** WWDG early-wakeup flag for the main loop. Set from WWDG_IRQHandler;
- *  a flag is used because only ~910us remain before the reset. */
+/** WWDG early-wakeup flag set from WWDG_IRQHandler; only ~910 us remain before reset. */
 volatile uint8_t wwdg_ewi_triggered = 0;
 
 /* System exception handlers */
@@ -52,14 +51,14 @@ void WWDG_IRQHandler(void)
  */
 void EXTI15_10_IRQHandler(void)
 {
-    /* A phase (PB12) falling edge: process encoder pulse */
+    /* A phase (PB12) falling edge */
     if (EXTI_GetITStatus(EXTI_Line12) != RESET)
     {
-        EXTI_ClearITPendingBit(EXTI_Line12);  /* Clear pending bit (write-1-to-clear) */
+        EXTI_ClearITPendingBit(EXTI_Line12);
         Encoder_OnInterrupt();
     }
 
-    /* B phase (PB13): clear flag only, unused in single-edge scheme */
+    /* B phase (PB13): clear flag only (single-edge scheme) */
     if (EXTI_GetITStatus(EXTI_Line13) != RESET)
     {
         EXTI_ClearITPendingBit(EXTI_Line13);

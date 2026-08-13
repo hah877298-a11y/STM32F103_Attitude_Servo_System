@@ -11,13 +11,12 @@
  *          distinct 7-bit addresses (MPU6050, SSD1306).
  */
 
-/* ========== 引脚宏定义 (方便修改) ========== */
-#define I2C_SCL_PIN       GPIO_Pin_10    /* PB10 → SCL 时钟线 */
-#define I2C_SDA_PIN       GPIO_Pin_11    /* PB11 → SDA 数据线 */
-#define I2C_PORT          GPIOB          /* 使用 GPIOB 端口 */
-#define I2C_RCC_CLOCK     RCC_APB2Periph_GPIOB  /* GPIOB 时钟 */
+/* ---- pin macros ---- */
+#define I2C_SCL_PIN       GPIO_Pin_10    /* PB10: SCL */
+#define I2C_SDA_PIN       GPIO_Pin_11    /* PB11: SDA */
+#define I2C_PORT          GPIOB
+#define I2C_RCC_CLOCK     RCC_APB2Periph_GPIOB
 
-/* ========== 底 层 GPIO 操 作 宏 ========== */
 /**
  * @name  Low-level bus operations
  * @note  Open-drain: SET releases the line (pull-up drives it high),
@@ -29,8 +28,9 @@
 #define I2C_SDA_L()       GPIO_ResetBits(I2C_PORT, I2C_SDA_PIN)
 
 #define I2C_SDA_READ()    GPIO_ReadInputDataBit(I2C_PORT, I2C_SDA_PIN)
+#define I2C_SCL_READ()    GPIO_ReadInputDataBit(I2C_PORT, I2C_SCL_PIN)
 
-/* ========== 对 外 接 口 函 数 ========== */
+/* ---- public API ---- */
 
 /**
  * @brief  Initialize I2C pins as open-drain outputs.

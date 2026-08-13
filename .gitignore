@@ -6,6 +6,7 @@ MDK-ARM/RTE/
 MDK-ARM/*.scvd
 MDK-ARM/*.uvguix.*
 MDK-ARM/objects/
+MDK-ARM/build_log.txt
 *.hex
 *.bin
 *.axf
